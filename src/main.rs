@@ -39,7 +39,7 @@ the format for each key/value entry is this:
 
 use crc::{CRC_32_ISO_HDLC, Crc};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter};
+use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     collections::HashMap,
@@ -50,8 +50,8 @@ use std::{
 
 struct KeydirEntry {
     file_id: String, // basically file name "timestamp.data"
-    value_sz: usize,
-    value_pos: usize,
+    value_sz: u64,
+    value_pos: u64,
     tstamp: u64,
 }
 
@@ -60,7 +60,7 @@ struct KVEngine {
     files: Option<Vec<PathBuf>>,
     key_dir: HashMap<String, KeydirEntry>,
     curr_file: Option<File>, // have a curr file to be the file you are currently writing on
-    curr_file_offset: u32,   // and a cursor
+    curr_file_offset: u64,   // and a cursor
 }
 const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1gb per file
 impl KVEngine {
@@ -68,7 +68,7 @@ impl KVEngine {
         let tstamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs();
+            .as_secs(); // maybe keep an index as well just to be sure
 
         let file_path = dir.join(format!("{}.data", tstamp));
         let file = OpenOptions::new()
@@ -80,10 +80,16 @@ impl KVEngine {
 
         Ok(file)
     }
+
+    fn build_key_dir_from_file(
+        keydir: HashMap<String, KeydirEntry>,
+    ) -> HashMap<String, KeydirEntry> {
+        unimplemented!()
+        // move keydir to function, function adds to it and gives it back to caller
+    }
     fn open(dir_name: &Path) -> io::Result<KVEngine> {
         let path = PathBuf::from(dir_name);
         let key_dir: HashMap<String, KeydirEntry> = HashMap::new();
-        let mut curr_file: File;
 
         // when open runs, // scan the directory for all the files
         let mut files: Vec<PathBuf> = Vec::new();
@@ -104,12 +110,32 @@ impl KVEngine {
                 .and_then(|y| y.to_str().and_then(|x| x.parse::<u64>().ok()))
         });
 
-        for file in files {
+        for file in &files {
+            let file_vec = fs::read(file)?;
+            // each entry looks like key: KeyDirEntry
+            // what we are reading: [ crc | tstamp | ksz | value_sz | key | value ]
+            //                      [ 32b |  64b   | 64b |    64b   | ksz | valuesz ]
+            // what we are building: key: {
+            // file_id(basically the current file name),
+            // value_size,
+            // value_position,
+            // time stamp
+            // }
+            let mut cursor = Cursor::new(file_vec);
+            let mut timestamp = [0u8; 8];
+            let mut key_size = [0u8; 8];
+            let mut value_size = [0u8; 8];
 
-            // lets rebuild keydir
-            // for now lets just go file by file, later we can do it in parallel + use hint files
+            while cursor.position() <= file.metadata()?.len() {
+                // skip the first 32 bits
+                cursor.seek(SeekFrom::Current(32))?;
+                cursor.read_exact(&mut timestamp).unwrap(); // put timestamp bytes into our slice
+                cursor.read_exact(&mut key_size).unwrap(); // put keysize bytes into our slice, this tells us how many bytes the key is
+                cursor.read_exact(&mut value_size).unwrap(); // put valuesize bytes into our slice
+                let key_size_num = u64::from_le_bytes(key_size) as usize;
+                let mut key = vec![0u8; key_size_num];
+            }
         }
-
         let mut self_instance = Self {
             data_directory: path,
             key_dir,
@@ -124,6 +150,7 @@ impl KVEngine {
                 // self_instance.curr_file = self_instance.create_new_file(dir_name)?
                 let new_file: File = KVEngine::create_new_file(dir_name)?; // i cant use .ok() here for some reason
                 self_instance.curr_file = Some(new_file);
+                self_instance.curr_file_offset = 0;
             } else {
                 let file = OpenOptions::new()
                     .create(true)
@@ -133,6 +160,7 @@ impl KVEngine {
                     .open(f)?;
 
                 self_instance.curr_file = Some(file);
+                self_instance.curr_file_offset = f_metadata.len();
             }
         }
 
@@ -157,7 +185,7 @@ impl KVEngine {
         // let checksum = crc32.checksum(&bytes_to_write);
 
         let key_as_bytes = key.as_bytes();
-        let ksz = key_as_bytes.len();
+        let ksz: usize = key_as_bytes.len();
         let value_size = value.len();
         bytes_to_write.extend_from_slice(&tstamp.to_le_bytes());
         bytes_to_write.extend_from_slice(&ksz.to_le_bytes());
