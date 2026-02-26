@@ -7,7 +7,6 @@ use std::{
     fmt::Error,
     path::{Path, PathBuf},
 };
-// structs and enums
 
 struct KeydirEntry {
     file_id: String, // basically file name "timestamp.data"
@@ -21,17 +20,18 @@ struct KVEngine {
     files: Option<Vec<PathBuf>>,
     key_dir: HashMap<String, KeydirEntry>,
     curr_file: Option<File>, // have a curr file to be the file you are currently writing on
-    curr_file_offset: u64,   // and a cursor
+    curr_file_path: Option<PathBuf>,
+    curr_file_offset: u64, // and a cursor
 }
 const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1gb per file
 impl KVEngine {
-    fn create_new_file(dir: &Path) -> io::Result<File> {
+    fn create_new_file(dir: &Path) -> io::Result<(File, PathBuf)> {
         let tstamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs(); // maybe keep an index as well just to be sure
 
-        let file_path = dir.join(format!("{}.data", tstamp));
+        let file_path = &dir.join(format!("{}.data", tstamp));
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -39,7 +39,7 @@ impl KVEngine {
             .create(true)
             .open(file_path)?;
 
-        Ok(file)
+        Ok((file, file_path.to_path_buf()))
     }
 
     fn build_key_dir_from_file(
@@ -155,14 +155,16 @@ impl KVEngine {
             key_dir,
             files: None,
             curr_file: None,
+            curr_file_path: None,
             curr_file_offset: 0,
         };
 
         if let Some(f) = files.last() {
             let f_metadata = f.metadata()?;
             if f_metadata.len() >= MAX_FILE_SIZE {
-                let new_file: File = KVEngine::create_new_file(dir_name)?;
+                let (new_file, new_file_path) = KVEngine::create_new_file(dir_name)?;
                 self_instance.curr_file = Some(new_file);
+                self_instance.curr_file_path = Some(new_file_path);
                 self_instance.curr_file_offset = 0;
             } else {
                 let file = OpenOptions::new()
@@ -173,25 +175,56 @@ impl KVEngine {
                     .open(f)?;
 
                 self_instance.curr_file = Some(file);
+                self_instance.curr_file_path = Some(f.to_path_buf());
                 self_instance.curr_file_offset = f_metadata.len();
             }
         } else {
-            let new_file: File = KVEngine::create_new_file(dir_name)?;
+            let (new_file, new_file_path) = KVEngine::create_new_file(dir_name)?;
             self_instance.curr_file = Some(new_file);
+            self_instance.curr_file_path = Some(new_file_path);
             self_instance.curr_file_offset = 0;
         }
 
         self_instance.files = Some(files);
         Ok(self_instance)
     }
-    fn get(&self) -> Result<Option<Vec<u8>>, Error> {
-        // will make a custom ValueNotFound Error later
-        unimplemented!()
+    fn get(&self, key: &str) -> io::Result<Vec<u8>> {
+        println!("inside get, key is {}", key);
+        let key_info = self
+            .key_dir
+            .get(key)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Key not found"))?;
+
+        let file_to_open = &key_info.file_id;
+        let value_position = key_info.value_pos;
+        let value_size = key_info.value_sz;
+
+        // check delete flag before you return
+
+        let mut f: File = fs::File::open(file_to_open)?; // opening file on every get, optimize later 
+        let mut data = vec![0; value_size as usize];
+        let mut flag_data = [0u8; 1];
+
+        f.seek(SeekFrom::Start(value_position))?;
+
+        f.read_exact(&mut data)?;
+        f.read_exact(&mut flag_data)?;
+
+        // this underneath works for now, will rethink later
+        if u8::from_le_bytes(flag_data) == 1 {
+            return Ok(data);
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "K/V was deleted",
+            ))
+        }
     }
+
     fn put(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
         // DataWriteFailed Error later
         let crc32 = Crc::<u32>::new(&CRC_32_ISO_HDLC); // put it somewhere else later
-        // this is the data block when we insert a key value: [ crc | tstamp | ksz | value_sz | key | value ]
+        // this is the data block when we insert a key value: [ crc | tstamp | ksz | value_sz | key | value | flag]
         let mut bytes_to_write = Vec::new();
         let tstamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -203,10 +236,14 @@ impl KVEngine {
         let key_as_bytes = key.as_bytes();
         let ksz: usize = key_as_bytes.len();
         let value_size = value.len();
+        println!("we are inside put");
+        println!("key is {}", key);
         bytes_to_write.extend_from_slice(&tstamp.to_le_bytes());
         bytes_to_write.extend_from_slice(&ksz.to_le_bytes());
         bytes_to_write.extend_from_slice(&value_size.to_le_bytes());
         bytes_to_write.extend_from_slice(key_as_bytes);
+
+        let value_position_in_file = bytes_to_write.len() as u64 + self.curr_file_offset + 4; // 4 is for the checksum bytes
         bytes_to_write.extend_from_slice(value);
         bytes_to_write.extend_from_slice(&[1u8]); // flag
         let checksum = crc32.checksum(&bytes_to_write);
@@ -215,23 +252,65 @@ impl KVEngine {
 
         if self.curr_file_offset + data_format.len() as u64 <= MAX_FILE_SIZE {
             // we have space so we write it on curr file
+            println!("we are writing in the current file");
             if let Some(f) = &mut self.curr_file {
                 f.write_all(&data_format)?;
                 f.sync_all()?; // syscalls on every write, ok for now
             } else {
-                let mut file = KVEngine::create_new_file(&self.data_directory)?;
+                let (file, filepath) = KVEngine::create_new_file(&self.data_directory)?;
                 self.curr_file = Some(file);
+                self.curr_file_path = Some(filepath);
                 self.curr_file_offset = 0;
                 if let Some(f) = &mut self.curr_file {
                     f.write_all(&data_format)?;
                     f.sync_all()?; // syscalls on every write, ok for now
                 }
             }
+        } else {
+            let (new_file, new_file_path) = KVEngine::create_new_file(&self.data_directory)?;
+            self.curr_file = Some(new_file);
+            self.curr_file_path = Some(new_file_path);
+            self.curr_file_offset = 0;
+            if let Some(f) = &mut self.curr_file {
+                f.write_all(&data_format)?;
+                f.sync_all()?; // syscalls on every write, ok for now
+            }
         }
-        unimplemented!()
+        let f_id = self
+            .curr_file_path
+            .as_ref()
+            .unwrap()
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned();
+
+        self.key_dir.insert(
+            key.to_string(),
+            KeydirEntry {
+                file_id: f_id,
+                value_sz: value_size as u64,
+                value_pos: value_position_in_file,
+                tstamp,
+            },
+        );
+        Ok(())
     }
-    fn delete(&mut self, key: &str) -> Result<(), Error> {
-        unimplemented!()
+    fn delete(&mut self, key: &str) -> io::Result<()> {
+        let key_info = self
+            .key_dir
+            .get(key)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Key not found"))?;
+
+        let file_to_open = &key_info.file_id;
+        let value_position = key_info.value_pos;
+        let value_size = key_info.value_sz;
+        let flag_position = value_position + value_size;
+
+        let mut f: File = fs::File::open(file_to_open)?;
+        f.seek(SeekFrom::Start(flag_position))?;
+        f.write_all(&[0u8])?;
+        f.sync_data()?;
+        Ok(())
     }
 
     fn list_keys(&self) -> Result<&[&str], Error> {
@@ -256,3 +335,22 @@ impl KVEngine {
     }
 }
 fn main() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    #[test]
+    fn test_get_after_put() {
+        // put value in storage, then retrieve
+        let dir = tempdir().unwrap();
+        let mut db = KVEngine::open(dir.path()).unwrap();
+        db.put("hello", b"world").unwrap();
+        assert_eq!(db.get("hello").unwrap(), b"world");
+    }
+
+    // #[test]
+    // fn delete_after_put() {
+    //     unimplemented!()
+    // }
+}

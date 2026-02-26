@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 crc = "3.4.0"
+tempfile = "3.26.0"
