@@ -1,45 +1,6 @@
-/*
-NOTES:
-Use fsync for writing data, when we use write() to write data to a file, the OS doesnt immediately put the data on disk.
-Intead it puts it in a page cache, which is an in memory buffer managed by the kernel. The OS will flush it to disk eventually,
-however the problem is that what if the machine crashes or we lose power or the OS panics before the data is written?
-Thats what fsync comes in, you basically tell teh OS "dont return until every byte we write to this file descriptor is in stable storage"
-fsync = success then data is safely on disk
-use Seek trait
-
-Things I need to do:
-we have a directory where we keep the data
-we write the data in files(1 gb max, then move to next file).
-We write to the active file by appending.
-Each write is simply a new entry to the active file.
-deletion is simply a write of a special tombstone value which will be removed on the next merge
-
-the format for each key/value entry is this:
-
-[ crc | tstamp | ksz | value_sz | key | value ]
-
- After the append completes, an in-memory structure called a keydir is updated.
- a keydir is a hashtable that maps every key in a BitCask to a fixed-size structure giving the file, offset
- and size of the most recently written entry for that key.
- key -> [ file_id | value_sz | value_pos | tstamp ]
- key -> [ file_id | value_sz | value_pos | tstamp ]
- key -> [ file_id | value_sz | value_pos | tstamp ]
-
- for a file_id use a file{index}.timestamp
- if a write occurs, we update the keydir with the location of the newest data. The old data will remain on disk, but
- new reads will use the latest version available in the keydir.
-
- Reading a value:
- we look up the key in the keydir and from there we use the data using the file_id(which file it is),
- position and size(so we know where in the file to start and where to stop).
-
-
-
-*/
-
 use crc::{CRC_32_ISO_HDLC, Crc};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom};
+use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     collections::HashMap,
@@ -89,7 +50,7 @@ impl KVEngine {
     }
     fn open(dir_name: &Path) -> io::Result<KVEngine> {
         let path = PathBuf::from(dir_name);
-        let key_dir: HashMap<String, KeydirEntry> = HashMap::new();
+        let mut key_dir: HashMap<String, KeydirEntry> = HashMap::new();
 
         // when open runs, // scan the directory for all the files
         let mut files: Vec<PathBuf> = Vec::new();
@@ -112,28 +73,81 @@ impl KVEngine {
 
         for file in &files {
             let file_vec = fs::read(file)?;
-            // each entry looks like key: KeyDirEntry
-            // what we are reading: [ crc | tstamp | ksz | value_sz | key | value ]
-            //                      [ 32b |  64b   | 64b |    64b   | ksz | valuesz ]
-            // what we are building: key: {
-            // file_id(basically the current file name),
-            // value_size,
-            // value_position,
-            // time stamp
-            // }
+
+            let file_name = file.file_stem().unwrap().to_str().unwrap(); // will not error because we are sure its a file therefore it has a stem
             let mut cursor = Cursor::new(file_vec);
             let mut timestamp = [0u8; 8];
             let mut key_size = [0u8; 8];
             let mut value_size = [0u8; 8];
+            let mut crc = [0u8; 4];
+            let mut flag = [0u8; 1];
 
-            while cursor.position() <= file.metadata()?.len() {
-                // skip the first 32 bits
-                cursor.seek(SeekFrom::Current(32))?;
-                cursor.read_exact(&mut timestamp).unwrap(); // put timestamp bytes into our slice
-                cursor.read_exact(&mut key_size).unwrap(); // put keysize bytes into our slice, this tells us how many bytes the key is
-                cursor.read_exact(&mut value_size).unwrap(); // put valuesize bytes into our slice
+            let crc32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+            let file_len = file.metadata()?.len();
+            // MAKE SURE THAT ONLY ALIVE k/v pairs are referenced.
+            // use a flag: [ crc | tstamp | ksz | value_sz |  key | value | flag  ]
+            // flag is either 1 or 0. 1 == active, 0 = deleted
+            while cursor.position() < file_len {
+                // reading sequential data that looks like:
+                //                      [ crc | tstamp | ksz | value_sz | key | value ]
+                //             sizes:   [ 32b |  64b   | 64b |    64b   | ksz | valuesz ]
+                cursor.read_exact(&mut crc)?;
+                cursor.read_exact(&mut timestamp)?; // put timestamp bytes into our slice
+                cursor.read_exact(&mut key_size)?; // put keysize bytes into our slice, this tells us how many bytes the key is
+                cursor.read_exact(&mut value_size)?; // put valuesize bytes into our slice
+                cursor.read_exact(&mut flag)?;
                 let key_size_num = u64::from_le_bytes(key_size) as usize;
+                let val_size_num = u64::from_le_bytes(value_size) as usize;
+
                 let mut key = vec![0u8; key_size_num];
+                let mut value = vec![0u8; val_size_num];
+
+                cursor.read_exact(&mut key)?;
+                let value_position = cursor.seek(SeekFrom::Current(0))?; // value starts here
+
+                cursor.read_exact(&mut value)?;
+
+                let key_as_str = match str::from_utf8(&key) {
+                    // check here is maybe uneccessary
+                    Ok(k) => k,
+                    Err(_r) => panic!("Invalid UTF8 on key"),
+                };
+
+                let timestmp = u64::from_le_bytes(timestamp);
+
+                let crc_from_buff = u32::from_le_bytes(crc);
+
+                // let mut buffer_without_crc = Vec::new();
+                let mut digest = crc32.digest();
+                digest.update(&timestamp);
+                digest.update(&key_size);
+                digest.update(&value_size);
+                digest.update(&key);
+                digest.update(&value);
+                digest.update(&flag);
+                let fresh_crc = digest.finalize();
+
+                if crc_from_buff != fresh_crc {
+                    // corrupted data, break
+                    break;
+                }
+
+                if u8::from_le_bytes(flag) == 1u8 {
+                    // if 1, it means it hasnt been deleted, if 0 though we should delete. impl later
+                    // what to do if data was bad? discard it?
+                    // for now discard
+                    key_dir.insert(
+                        key_as_str.to_string(),
+                        KeydirEntry {
+                            file_id: file_name.to_string(),
+                            value_sz: val_size_num as u64,
+                            value_pos: value_position,
+                            tstamp: timestmp,
+                        },
+                    );
+                } else {
+                    // delete? will figure out
+                }
             }
         }
         let mut self_instance = Self {
@@ -147,8 +161,7 @@ impl KVEngine {
         if let Some(f) = files.last() {
             let f_metadata = f.metadata()?;
             if f_metadata.len() >= MAX_FILE_SIZE {
-                // self_instance.curr_file = self_instance.create_new_file(dir_name)?
-                let new_file: File = KVEngine::create_new_file(dir_name)?; // i cant use .ok() here for some reason
+                let new_file: File = KVEngine::create_new_file(dir_name)?;
                 self_instance.curr_file = Some(new_file);
                 self_instance.curr_file_offset = 0;
             } else {
@@ -162,6 +175,10 @@ impl KVEngine {
                 self_instance.curr_file = Some(file);
                 self_instance.curr_file_offset = f_metadata.len();
             }
+        } else {
+            let new_file: File = KVEngine::create_new_file(dir_name)?;
+            self_instance.curr_file = Some(new_file);
+            self_instance.curr_file_offset = 0;
         }
 
         self_instance.files = Some(files);
@@ -171,7 +188,7 @@ impl KVEngine {
         // will make a custom ValueNotFound Error later
         unimplemented!()
     }
-    fn put(&mut self, key: &str, value: &[u8]) -> Result<(), Error> {
+    fn put(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
         // DataWriteFailed Error later
         let crc32 = Crc::<u32>::new(&CRC_32_ISO_HDLC); // put it somewhere else later
         // this is the data block when we insert a key value: [ crc | tstamp | ksz | value_sz | key | value ]
@@ -182,7 +199,6 @@ impl KVEngine {
             .as_secs();
 
         // compute crc
-        // let checksum = crc32.checksum(&bytes_to_write);
 
         let key_as_bytes = key.as_bytes();
         let ksz: usize = key_as_bytes.len();
@@ -192,10 +208,26 @@ impl KVEngine {
         bytes_to_write.extend_from_slice(&value_size.to_le_bytes());
         bytes_to_write.extend_from_slice(key_as_bytes);
         bytes_to_write.extend_from_slice(value);
+        bytes_to_write.extend_from_slice(&[1u8]); // flag
         let checksum = crc32.checksum(&bytes_to_write);
         let mut data_format = checksum.to_le_bytes().to_vec();
         data_format.extend(bytes_to_write);
 
+        if self.curr_file_offset + data_format.len() as u64 <= MAX_FILE_SIZE {
+            // we have space so we write it on curr file
+            if let Some(f) = &mut self.curr_file {
+                f.write_all(&data_format)?;
+                f.sync_all()?; // syscalls on every write, ok for now
+            } else {
+                let mut file = KVEngine::create_new_file(&self.data_directory)?;
+                self.curr_file = Some(file);
+                self.curr_file_offset = 0;
+                if let Some(f) = &mut self.curr_file {
+                    f.write_all(&data_format)?;
+                    f.sync_all()?; // syscalls on every write, ok for now
+                }
+            }
+        }
         unimplemented!()
     }
     fn delete(&mut self, key: &str) -> Result<(), Error> {
