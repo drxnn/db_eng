@@ -1,7 +1,7 @@
 use crc::{CRC_32_ISO_HDLC, Crc};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{
     collections::HashMap,
     fmt::Error,
@@ -15,6 +15,12 @@ struct KeydirEntry {
     tstamp: u64,
 }
 
+enum SyncConfig {
+    None,       // fast
+    Every(u64), // in ms
+    Always,     // Durable
+}
+
 struct KVEngine {
     data_directory: PathBuf,
     files: Option<Vec<PathBuf>>,
@@ -22,6 +28,7 @@ struct KVEngine {
     curr_file: Option<File>, // have a curr file to be the file you are currently writing on
     curr_file_path: Option<PathBuf>,
     curr_file_offset: u64, // and a cursor
+    sync_config: SyncConfig,
 }
 const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1gb per file
 impl KVEngine {
@@ -48,7 +55,7 @@ impl KVEngine {
         unimplemented!()
         // move keydir to function, function adds to it and gives it back to caller
     }
-    fn open(dir_name: &Path) -> io::Result<KVEngine> {
+    fn open(dir_name: &Path, sync_config: SyncConfig) -> io::Result<KVEngine> {
         let path = PathBuf::from(dir_name);
         let mut key_dir: HashMap<String, KeydirEntry> = HashMap::new();
 
@@ -150,6 +157,7 @@ impl KVEngine {
                 }
             }
         }
+
         let mut self_instance = Self {
             data_directory: path,
             key_dir,
@@ -157,6 +165,7 @@ impl KVEngine {
             curr_file: None,
             curr_file_path: None,
             curr_file_offset: 0,
+            sync_config,
         };
 
         if let Some(f) = files.last() {
@@ -412,7 +421,8 @@ impl KVEngine {
                     let fresh_crc = digest.finalize();
 
                     if crc_from_buff != fresh_crc {
-                        // corrupted dont trust file
+                        // corrupted dont trust file.
+                        // later we can check if we have a backup for this file and read it from there
                         break;
                     }
 
@@ -442,6 +452,8 @@ impl KVEngine {
 
                         fresh_file.write_all(&bytes_to_write_to_fresh)?; // syscall
                         fresh_file.sync_all()?; // syscall
+                    } else {
+                        self.key_dir.remove(key_as_str);
                     }
                 }
 
@@ -474,7 +486,7 @@ mod tests {
     fn test_get_after_put() {
         // put value in storage, then retrieve
         let dir = tempdir().unwrap();
-        let mut db = KVEngine::open(dir.path()).unwrap();
+        let mut db = KVEngine::open(dir.path(), SyncConfig::None).unwrap();
         db.put("hello", b"world").unwrap();
         assert_eq!(db.get("hello").unwrap(), b"world");
     }
@@ -487,7 +499,7 @@ mod tests {
     #[test]
     fn print_keys() {
         let dir = tempdir().unwrap();
-        let mut db = KVEngine::open(dir.path()).unwrap();
+        let mut db = KVEngine::open(dir.path(), SyncConfig::None).unwrap();
         let mut vec: Vec<String> = Vec::new();
         db.put("hello", b"world").unwrap();
         db.put("otherkey", b"world").unwrap();
@@ -500,18 +512,20 @@ mod tests {
         assert_eq!(vec.len(), 4);
     }
 
-    #[test]
-    fn merge_files() {
-        let dir = tempdir().unwrap();
-        let file_1 = tempfile().unwrap();
-        let file_2 = tempfile().unwrap();
-        let mut db = KVEngine::open(dir.path()).unwrap();
-    }
+    // #[test]
+    // fn merge_files() {
+    //     let dir = tempdir().unwrap();
+    //     let file_1 = tempfile().unwrap();
+    //     let file_2 = tempfile().unwrap();
+    //     let mut db = KVEngine::open(dir.path()).unwrap();
+    // }
 }
 
 /*
 Documentation for myself:
-data format for files:   [ crc | tstamp | ksz | value_sz | key | value | flag ]
+data format for files:   [ crc | tstamp | ksz | value_sz | key | value | flag ], will change instead to [ crc | tstamp | ksz | value_sz | key | value ]
+// and do append only.
+
 
 data format for hint files:  [k_size, key, file_id, data_position ] // file is the timestamp, since we are doing tstamp.data
 
