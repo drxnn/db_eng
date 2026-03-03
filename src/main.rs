@@ -10,7 +10,7 @@ use std::{
 };
 
 struct KeydirEntry {
-    file_id: String, // basically file name "timestamp.data"
+    file_id: String, // basically file name "timestamp.data" or "timestamp.hint"
     value_sz: u64,
     value_pos: u64,
     tstamp: u64,
@@ -26,7 +26,7 @@ struct KVEngine {
     data_directory: PathBuf,
     files: Option<Vec<PathBuf>>,
     key_dir: HashMap<String, KeydirEntry>,
-    curr_file: Option<File>, // have a curr file to be the file you are currently writing on
+    curr_file: Option<BufWriter<File>>, // have a curr file to be the file you are currently writing on
     curr_file_path: Option<PathBuf>,
     curr_file_offset: u64, // and a cursor
     sync_config: SyncConfig,
@@ -180,7 +180,8 @@ impl KVEngine {
             if f_metadata.len() >= MAX_FILE_SIZE {
                 let (new_data_file_tuple, new_hint_file_tuple, _) =
                     KVEngine::create_new_file(dir_name)?;
-                self_instance.curr_file = Some(new_data_file_tuple.0);
+                self_instance.curr_file =
+                    Some(BufWriter::with_capacity(256000, new_data_file_tuple.0));
                 self_instance.curr_file_path = Some(new_data_file_tuple.1);
                 self_instance.curr_file_offset = 0;
             } else {
@@ -191,14 +192,14 @@ impl KVEngine {
                     .write(true)
                     .open(f)?;
 
-                self_instance.curr_file = Some(file);
+                self_instance.curr_file = Some(BufWriter::with_capacity(256000, file));
                 self_instance.curr_file_path = Some(f.to_path_buf());
                 self_instance.curr_file_offset = f_metadata.len();
             }
         } else {
             let (new_data_file_tuple, new_hint_file_tuple, _) =
                 KVEngine::create_new_file(dir_name)?;
-            self_instance.curr_file = Some(new_data_file_tuple.0);
+            self_instance.curr_file = Some(BufWriter::with_capacity(256000, new_data_file_tuple.0));
             self_instance.curr_file_path = Some(new_data_file_tuple.1);
             self_instance.curr_file_offset = 0;
         }
@@ -268,28 +269,28 @@ impl KVEngine {
             println!("we are writing in the current file");
             if let Some(f) = &mut self.curr_file {
                 f.write_all(&data_format)?;
-                f.sync_all()?; // syscalls on every write, ok for now
+
                 self.curr_file_offset += data_format.len() as u64;
             } else {
                 let (new_data_file_tuple, new_hint_file_tuple, _) =
                     KVEngine::create_new_file(&self.data_directory)?;
-                self.curr_file = Some(new_data_file_tuple.0);
+                self.curr_file = Some(BufWriter::with_capacity(256000, new_data_file_tuple.0));
                 self.curr_file_path = Some(new_data_file_tuple.1);
                 self.curr_file_offset = 0;
                 if let Some(f) = &mut self.curr_file {
                     f.write_all(&data_format)?;
-                    f.sync_all()?; // syscalls on every write, ok for now
+                    self.curr_file_offset += data_format.len() as u64;
                 }
             }
         } else {
             let (new_data_file_tuple, new_hint_file_tuple, _) =
                 KVEngine::create_new_file(&self.data_directory)?;
-            self.curr_file = Some(new_data_file_tuple.0);
+            self.curr_file = Some(BufWriter::with_capacity(256000, new_data_file_tuple.0));
             self.curr_file_path = Some(new_data_file_tuple.1);
             self.curr_file_offset = 0;
             if let Some(f) = &mut self.curr_file {
                 f.write_all(&data_format)?;
-                f.sync_all()?; // syscalls on every write, ok for now
+                self.curr_file_offset += data_format.len() as u64;
             }
         }
         let f_id = self
@@ -363,24 +364,14 @@ impl KVEngine {
         Ok(acc)
     }
     fn merge(&mut self) -> io::Result<()> {
-        // merges several data files within a Bitcask datastore into a more compact form. Also, produce hint files for faster startup
-        /*
-        Go through all the older data files(that dont have a hint file) and merge them together in a FILE.
-        Throughout the way, produce the hint file for the big merge file.
-        the hint file is the one we go through, to find our k/v pairs. so it should be [tstamp. key, keysz, val_position, val_size] // no value
-
-        // Before merge, make sure that you check if you have enough disk size, to first add the new merged files, then delete old ones, or add one delete one but still check
-
-        */
-
         if let Some(vec) = self.files.as_ref() {
             let mut fresh_files: Vec<PathBuf> = Vec::new();
 
             let (new_data_file_tuple, new_hint_file_tuple, mut tstamp) =
                 KVEngine::create_new_file(&self.data_directory)?;
 
-            let mut fresh_file = new_data_file_tuple.0;
-            let mut hint_file = new_hint_file_tuple.0;
+            let mut fresh_file = BufWriter::with_capacity(256000, new_data_file_tuple.0);
+            let mut hint_file = BufWriter::with_capacity(256000, new_hint_file_tuple.0);
             let mut f_name = new_data_file_tuple.1;
             let mut h_name = new_hint_file_tuple.1;
             fresh_files.push(PathBuf::from(&f_name));
@@ -450,23 +441,20 @@ impl KVEngine {
                         ]
                         .concat();
 
-                        let fresh_file_cursor_pos = fresh_file.seek(SeekFrom::Current(0))?;
-                        let value_position = fresh_file_cursor_pos + 28 + key_size_num as u64;
+                        let value_position = fresh_file_length + 28 + key_size_num as u64;
                         let bytes_to_write_to_hint: Vec<u8> = [
                             key_size.as_slice(),
                             key.as_slice(),
                             &timestamp,
-                            &fresh_file_cursor_pos.to_le_bytes(),
+                            &fresh_file_length.to_le_bytes(),
                         ]
                         .concat();
 
                         let fresh_bytes_len = bytes_to_write_to_fresh.len() as u64;
                         if (fresh_file_length + fresh_bytes_len) < MAX_FILE_SIZE {
-                            hint_file.write_all(&bytes_to_write_to_hint)?; // syscall
-                            hint_file.sync_all()?; // syscall
+                            hint_file.write_all(&bytes_to_write_to_hint)?;
 
-                            fresh_file.write_all(&bytes_to_write_to_fresh)?; // syscall
-                            fresh_file.sync_all()?; // syscall
+                            fresh_file.write_all(&bytes_to_write_to_fresh)?;
 
                             fresh_file_length += fresh_bytes_len;
                             self.key_dir.insert(
@@ -482,24 +470,32 @@ impl KVEngine {
                             let (new_data_file_tuple, new_hint_file_tuple, _) =
                                 KVEngine::create_new_file(&self.data_directory)?;
 
-                            hint_file = new_hint_file_tuple.0;
+                            fresh_file.flush()?;
+                            hint_file.flush()?;
+                            hint_file = BufWriter::with_capacity(256000, new_hint_file_tuple.0);
 
-                            fresh_file = new_data_file_tuple.0;
+                            fresh_file = BufWriter::with_capacity(256000, new_data_file_tuple.0);
                             fresh_file_length = 0;
+
                             f_name = new_data_file_tuple.1;
                             h_name = new_hint_file_tuple.1;
                             fresh_files.push(f_name.clone());
                             fresh_files.push(h_name);
 
                             let value_position = 28 + key_size_num as u64; // file is fresh
+                            let bytes_to_write_to_hint: Vec<u8> = [
+                                key_size.as_slice(),
+                                key.as_slice(),
+                                &timestamp,
+                                &fresh_file_length.to_le_bytes(),
+                            ]
+                            .concat();
 
-                            hint_file.write_all(&bytes_to_write_to_hint)?; // syscall
-                            hint_file.sync_all()?; // syscall
+                            hint_file.write_all(&bytes_to_write_to_hint)?;
 
-                            fresh_file.write_all(&bytes_to_write_to_fresh)?; // syscall
-                            fresh_file.sync_all()?; // syscall
-
+                            fresh_file.write_all(&bytes_to_write_to_fresh)?;
                             fresh_file_length += fresh_bytes_len;
+
                             self.key_dir.insert(
                                 key_as_str.to_string(),
                                 KeydirEntry {
@@ -525,13 +521,20 @@ impl KVEngine {
         Ok(())
     }
 
-    fn sync(&mut self) {
-        unimplemented!()
+    fn sync(&mut self) -> io::Result<()> {
         // forces any writes to sync to disk
+        if let Some(writer) = &mut self.curr_file {
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
+
+        Ok(())
     }
 
-    fn close(&mut self) {
-        unimplemented!()
+    fn close(&mut self) -> io::Result<()> {
+        self.sync()?;
+
+        Ok(())
     }
 }
 fn main() {}
@@ -570,13 +573,25 @@ mod tests {
         assert_eq!(vec.len(), 4);
     }
 
-    // #[test]
-    // fn merge_files() {
-    //     let dir = tempdir().unwrap();
-    //     let file_1 = tempfile().unwrap();
-    //     let file_2 = tempfile().unwrap();
-    //     let mut db = KVEngine::open(dir.path()).unwrap();
-    // }
+    #[test]
+    fn merge_files() {
+        let dir = tempdir().unwrap();
+
+        let mut db = KVEngine::open(dir.path(), SyncConfig::None).unwrap();
+        let mut vec: Vec<String> = Vec::new();
+        db.put("hello", b"world").unwrap();
+        db.put("otherkey", b"world").unwrap();
+        db.put("thekey", b"world").unwrap();
+        db.put("space", b"world").unwrap();
+        db.delete("thekey").unwrap();
+        db.delete("otherkey").unwrap();
+
+        db.merge().unwrap();
+        vec = db.list_keys().unwrap();
+        vec.sort();
+        assert_eq!(vec, vec!["hello", "space"]);
+        assert_eq!(vec.len(), 2);
+    }
 }
 
 /*
