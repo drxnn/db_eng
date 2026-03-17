@@ -1,5 +1,7 @@
 use crc::{CRC_32_ISO_HDLC, Crc};
+use std::collections::HashSet;
 use std::collections::btree_map::Values;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -74,25 +76,50 @@ impl KVEngine {
 
         // when open runs, // scan the directory for all the files
         let mut files: Vec<PathBuf> = Vec::new();
+        let mut files_for_keydir_rebuild: HashMap<String, (String, PathBuf)> = HashMap::new();
 
         for entry in fs::read_dir(dir_name)? {
             let entry = entry?;
             let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
             println!("Name: {}", path.display());
 
-            if path.is_file() && path.extension().unwrap() == "data" {
-                // later we check the hint files
-                files.push(path);
+            let (stem, ext) = match (path.file_stem(), path.extension()) {
+                (Some(s), Some(e)) => match (s.to_str(), e.to_str()) {
+                    (Some(s), Some(e)) => (s.to_string(), e.to_string()),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+
+            match ext.as_str() {
+                "hint" => {
+                    files_for_keydir_rebuild.insert(stem, ("hint".to_string(), path.clone()));
+                }
+                "data" => {
+                    files_for_keydir_rebuild
+                        .entry(stem)
+                        .or_insert(("data".to_string(), path.clone()));
+                }
+                _ => continue,
             }
+
+            files.push(path);
         }
 
-        files.sort_by_key(|x| {
-            x.file_stem()
-                .and_then(|y| y.to_str().and_then(|x| x.parse::<u64>().ok()))
-        });
+        let mut files_for_keydir_rebuild_as_vec: Vec<_> =
+            files_for_keydir_rebuild.into_iter().collect();
+        files_for_keydir_rebuild_as_vec.sort_by_key(|x| x.0.parse::<u64>().ok());
 
-        for file in &files {
-            let file_vec = fs::read(file)?;
+        for (_, (ext, file)) in &files_for_keydir_rebuild_as_vec {
+            match ext.as_str() {
+                "hint" => { /*use hint file, faster */ }
+                "data" => {}
+                _ => {}
+            }
+            let file_vec = fs::read(file)?; // mmap?
 
             let file_name = file.to_str().unwrap();
             let mut cursor = Cursor::new(file_vec);
@@ -628,5 +655,7 @@ data format for files:   [ crc | tstamp | ksz | value_sz | key | value ]
 
 data format for hint files:  [ k_size, key, file_id, data_position ] // file is the timestamp, since we are doing tstamp.data
 // hint file doesnt actually need file id, because it has the same fileid as the file.data, file.hint file == file
+
+// when rebuilding keydir, we use a hint file if we have one, or use .data. We create hint files on merge
 
 */
