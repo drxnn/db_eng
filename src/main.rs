@@ -1,18 +1,18 @@
 use crc::{CRC_32_ISO_HDLC, Crc};
-use std::collections::HashSet;
-use std::collections::btree_map::Values;
-use std::ffi::OsStr;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     collections::HashMap,
-    fmt::Error,
     path::{Path, PathBuf},
 };
 
+use crate::helpers::compute_crc;
+
+mod helpers;
 struct KeydirEntry {
-    file_id: String, // basically file name "timestamp.data" or "timestamp.hint"
+    file_id: String, // basically file name "timestamp.data"
     value_sz: u64,
     value_pos: u64,
     tstamp: u64,
@@ -21,7 +21,7 @@ struct KeydirEntry {
 enum SyncConfig {
     None,       // fast
     Every(u64), // in ms
-    Always,     // Durable
+    Always,     // Ddurable
 }
 
 struct KVEngine {
@@ -35,33 +35,33 @@ struct KVEngine {
 }
 const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1gb per file
 impl KVEngine {
-    fn create_new_file(dir: &Path) -> io::Result<((File, PathBuf), (File, PathBuf), u64)> {
-        let tstamp = SystemTime::now()
+    fn new_timestamp() -> u64 {
+        SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs(); // maybe keep an index as well just to be sure
+            .as_nanos() as u64
+    }
 
-        let data_file_path = &dir.join(format!("{}.data", tstamp));
-        let hint_file_path = &dir.join(format!("{}.hint", tstamp));
+    fn create_new_data_file(dir: &Path, tstamp: u64) -> io::Result<(File, PathBuf)> {
+        let data_file_path = dir.join(format!("{}.data", tstamp));
         let data_file = OpenOptions::new()
             .read(true)
             .write(true)
             .append(true)
             .create(true)
-            .open(data_file_path)?;
+            .open(&data_file_path)?;
+        Ok((data_file, data_file_path))
+    }
 
+    fn create_new_hint_file(dir: &Path, tstamp: u64) -> io::Result<(File, PathBuf)> {
+        let hint_file_path = dir.join(format!("{}.hint", tstamp));
         let hint_file = OpenOptions::new()
             .read(true)
             .write(true)
             .append(true)
             .create(true)
-            .open(hint_file_path)?;
-
-        Ok((
-            (data_file, data_file_path.to_path_buf()),
-            (hint_file, hint_file_path.to_path_buf()),
-            tstamp,
-        ))
+            .open(&hint_file_path)?;
+        Ok((hint_file, hint_file_path))
     }
 
     fn build_key_dir_from_file(
@@ -102,93 +102,137 @@ impl KVEngine {
                     files_for_keydir_rebuild
                         .entry(stem)
                         .or_insert(("data".to_string(), path.clone()));
+                    files.push(path);
                 }
+
                 _ => continue,
             }
-
-            files.push(path);
         }
 
+        // note: instead of full pathbuf, just include the file_id, then add the extension later when needed
         let mut files_for_keydir_rebuild_as_vec: Vec<_> =
             files_for_keydir_rebuild.into_iter().collect();
         files_for_keydir_rebuild_as_vec.sort_by_key(|x| x.0.parse::<u64>().ok());
+        files.sort_by_key(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok())
+        });
 
-        for (_, (ext, file)) in &files_for_keydir_rebuild_as_vec {
+        for (file_id, (ext, file)) in &files_for_keydir_rebuild_as_vec {
             match ext.as_str() {
-                "hint" => { /*use hint file, faster */ }
-                "data" => {}
+                "hint" => {
+                    let hint_file_to_read = fs::read(file)?;
+                    let hint_file_len = file.metadata()?.len();
+                    let data_file_id = file.with_extension("data");
+
+                    let mut cursor = Cursor::new(hint_file_to_read);
+                    let mut timestamp = [0u8; 8];
+                    let mut key_size = [0u8; 8];
+                    let mut value_size = [0u8; 8];
+                    let mut data_position = [0u8; 8];
+                    while cursor.position() < hint_file_len {
+                        //
+                        //[ k_size, key, tstamp, value_sz, data_position ]
+                        // [  u64,   ksz     u64,     u64,      u64]
+                        cursor.read_exact(&mut key_size)?;
+                        let key_size_num = u64::from_le_bytes(key_size) as usize;
+                        let mut key = vec![0u8; key_size_num];
+                        cursor.read_exact(&mut key)?;
+                        cursor.read_exact(&mut timestamp)?;
+                        cursor.read_exact(&mut value_size)?;
+                        cursor.read_exact(&mut data_position)?;
+                        let value_position = u64::from_le_bytes(data_position);
+                        let val_size_num = u64::from_le_bytes(value_size) as usize;
+                        let key_as_str = match str::from_utf8(&key) {
+                            // check here is maybe uneccessary
+                            Ok(k) => k,
+                            Err(_r) => panic!("Invalid UTF8 on key"),
+                        };
+                        let timestmp = u64::from_le_bytes(timestamp);
+
+                        key_dir.insert(
+                            key_as_str.to_string(),
+                            KeydirEntry {
+                                file_id: data_file_id.display().to_string(),
+                                value_sz: val_size_num as u64,
+                                value_pos: value_position,
+                                tstamp: timestmp,
+                            },
+                        );
+                    }
+                }
+                "data" => {
+                    let file_vec = fs::read(file)?;
+
+                    let file_name = file.to_str().unwrap();
+                    let mut cursor = Cursor::new(file_vec);
+                    let mut timestamp = [0u8; 8];
+                    let mut key_size = [0u8; 8];
+                    let mut value_size = [0u8; 8];
+                    let mut crc = [0u8; 4];
+
+                    let file_len = file.metadata()?.len();
+
+                    while cursor.position() < file_len {
+                        // reading sequential data that looks like:
+                        //                      [ crc | tstamp | ksz | value_sz | key | value ]
+                        //             sizes:   [ 32b |  64b   | 64b |    64b   | ksz | valuesz ]
+                        cursor.read_exact(&mut crc)?;
+                        cursor.read_exact(&mut timestamp)?; // put timestamp bytes into our slice
+                        cursor.read_exact(&mut key_size)?; // put keysize bytes into our slice, this tells us how many bytes the key is
+                        cursor.read_exact(&mut value_size)?; // put valuesize bytes into our slice
+
+                        let key_size_num = u64::from_le_bytes(key_size) as usize;
+                        let val_size_num = u64::from_le_bytes(value_size) as usize;
+
+                        let mut key = vec![0u8; key_size_num];
+                        let mut value = vec![0u8; val_size_num];
+
+                        cursor.read_exact(&mut key)?;
+                        let value_position = cursor.seek(SeekFrom::Current(0))?; // value starts here
+
+                        cursor.read_exact(&mut value)?;
+
+                        let key_as_str = match str::from_utf8(&key) {
+                            // check here is maybe uneccessary
+                            Ok(k) => k,
+                            Err(_r) => panic!("Invalid UTF8 on key"),
+                        };
+
+                        let timestmp = u64::from_le_bytes(timestamp);
+
+                        let crc_from_buff = u32::from_le_bytes(crc);
+
+                        let fresh_crc = compute_crc(
+                            &timestamp,
+                            &key_size,
+                            &value_size,
+                            key.as_slice(),
+                            value.as_slice(),
+                        );
+
+                        if crc_from_buff != fresh_crc {
+                            // corrupted data, break
+                            break;
+                        }
+
+                        if val_size_num != 0 {
+                            key_dir.insert(
+                                key_as_str.to_string(),
+                                KeydirEntry {
+                                    file_id: file_name.to_string(),
+                                    value_sz: val_size_num as u64,
+                                    value_pos: value_position,
+                                    tstamp: timestmp,
+                                },
+                            );
+                        } else {
+                            key_dir.remove(key_as_str); // if its there
+                        }
+                    }
+                }
                 _ => {}
-            }
-            let file_vec = fs::read(file)?; // mmap?
-
-            let file_name = file.to_str().unwrap();
-            let mut cursor = Cursor::new(file_vec);
-            let mut timestamp = [0u8; 8];
-            let mut key_size = [0u8; 8];
-            let mut value_size = [0u8; 8];
-            let mut crc = [0u8; 4];
-
-            let crc32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
-            let file_len = file.metadata()?.len();
-
-            while cursor.position() < file_len {
-                // reading sequential data that looks like:
-                //                      [ crc | tstamp | ksz | value_sz | key | value ]
-                //             sizes:   [ 32b |  64b   | 64b |    64b   | ksz | valuesz ]
-                cursor.read_exact(&mut crc)?;
-                cursor.read_exact(&mut timestamp)?; // put timestamp bytes into our slice
-                cursor.read_exact(&mut key_size)?; // put keysize bytes into our slice, this tells us how many bytes the key is
-                cursor.read_exact(&mut value_size)?; // put valuesize bytes into our slice
-
-                let key_size_num = u64::from_le_bytes(key_size) as usize;
-                let val_size_num = u64::from_le_bytes(value_size) as usize;
-
-                let mut key = vec![0u8; key_size_num];
-                let mut value = vec![0u8; val_size_num];
-
-                cursor.read_exact(&mut key)?;
-                let value_position = cursor.seek(SeekFrom::Current(0))?; // value starts here
-
-                cursor.read_exact(&mut value)?;
-
-                let key_as_str = match str::from_utf8(&key) {
-                    // check here is maybe uneccessary
-                    Ok(k) => k,
-                    Err(_r) => panic!("Invalid UTF8 on key"),
-                };
-
-                let timestmp = u64::from_le_bytes(timestamp);
-
-                let crc_from_buff = u32::from_le_bytes(crc);
-
-                // let mut buffer_without_crc = Vec::new();
-                let mut digest = crc32.digest();
-                digest.update(&timestamp);
-                digest.update(&key_size);
-                digest.update(&value_size);
-                digest.update(&key);
-                digest.update(&value);
-
-                let fresh_crc = digest.finalize();
-
-                if crc_from_buff != fresh_crc {
-                    // corrupted data, break
-                    break;
-                }
-
-                if val_size_num != 0 {
-                    key_dir.insert(
-                        key_as_str.to_string(),
-                        KeydirEntry {
-                            file_id: file_name.to_string(),
-                            value_sz: val_size_num as u64,
-                            value_pos: value_position,
-                            tstamp: timestmp,
-                        },
-                    );
-                } else {
-                    key_dir.remove(key_as_str); // if its there
-                }
             }
         }
 
@@ -205,12 +249,7 @@ impl KVEngine {
         if let Some(f) = files.last() {
             let f_metadata = f.metadata()?;
             if f_metadata.len() >= MAX_FILE_SIZE {
-                let (new_data_file_tuple, new_hint_file_tuple, _) =
-                    KVEngine::create_new_file(dir_name)?;
-                self_instance.curr_file =
-                    Some(BufWriter::with_capacity(256000, new_data_file_tuple.0));
-                self_instance.curr_file_path = Some(new_data_file_tuple.1);
-                self_instance.curr_file_offset = 0;
+                self_instance.rotate_active_file()?;
             } else {
                 let file = OpenOptions::new()
                     .create(true)
@@ -222,13 +261,10 @@ impl KVEngine {
                 self_instance.curr_file = Some(BufWriter::with_capacity(256000, file));
                 self_instance.curr_file_path = Some(f.to_path_buf());
                 self_instance.curr_file_offset = f_metadata.len();
+                files.pop(); // active file shouldnt be in files
             }
         } else {
-            let (new_data_file_tuple, new_hint_file_tuple, _) =
-                KVEngine::create_new_file(dir_name)?;
-            self_instance.curr_file = Some(BufWriter::with_capacity(256000, new_data_file_tuple.0));
-            self_instance.curr_file_path = Some(new_data_file_tuple.1);
-            self_instance.curr_file_offset = 0;
+            self_instance.rotate_active_file()?;
         }
 
         self_instance.files = Some(files);
@@ -252,21 +288,13 @@ impl KVEngine {
 
         f.read_exact(&mut data)?;
 
-        if value_size != 0 {
-            return Ok(data);
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "K/V was deleted",
-            ))
-        }
+        return Ok(data);
     }
 
     fn put(&mut self, key: &str, value: &[u8]) -> io::Result<()> {
         // DataWriteFailed Error later
-        let crc32 = Crc::<u32>::new(&CRC_32_ISO_HDLC); // put it somewhere else later
         // this is the data block when we insert a key value: [ crc | tstamp | ksz | value_sz | key | value ]
-        let mut bytes_to_write = Vec::new();
+
         let tstamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -275,21 +303,12 @@ impl KVEngine {
         // compute crc
 
         let key_as_bytes = key.as_bytes();
-        let ksz: usize = key_as_bytes.len();
         let value_size = value.len();
+        let data_format = KVEngine::serialize_record(tstamp, key_as_bytes, value);
         println!("we are inside put");
         println!("key is {}", key);
-        bytes_to_write.extend_from_slice(&tstamp.to_le_bytes());
-        bytes_to_write.extend_from_slice(&ksz.to_le_bytes());
-        bytes_to_write.extend_from_slice(&value_size.to_le_bytes());
-        bytes_to_write.extend_from_slice(key_as_bytes);
 
-        let value_position_in_file = bytes_to_write.len() as u64 + self.curr_file_offset + 4; // 4 is for the checksum bytes
-        bytes_to_write.extend_from_slice(value);
-
-        let checksum = crc32.checksum(&bytes_to_write);
-        let mut data_format = checksum.to_le_bytes().to_vec();
-        data_format.extend(bytes_to_write);
+        let mut value_position_in_file = 28 + self.curr_file_offset + key_as_bytes.len() as u64;
 
         if self.curr_file_offset + data_format.len() as u64 <= MAX_FILE_SIZE {
             // we have space so we write it on curr file
@@ -299,22 +318,17 @@ impl KVEngine {
 
                 self.curr_file_offset += data_format.len() as u64;
             } else {
-                let (new_data_file_tuple, new_hint_file_tuple, _) =
-                    KVEngine::create_new_file(&self.data_directory)?;
-                self.curr_file = Some(BufWriter::with_capacity(256000, new_data_file_tuple.0));
-                self.curr_file_path = Some(new_data_file_tuple.1);
-                self.curr_file_offset = 0;
+                self.rotate_active_file()?;
+                value_position_in_file = 28 + key_as_bytes.len() as u64;
                 if let Some(f) = &mut self.curr_file {
                     f.write_all(&data_format)?;
                     self.curr_file_offset += data_format.len() as u64;
                 }
             }
         } else {
-            let (new_data_file_tuple, new_hint_file_tuple, _) =
-                KVEngine::create_new_file(&self.data_directory)?;
-            self.curr_file = Some(BufWriter::with_capacity(256000, new_data_file_tuple.0));
-            self.curr_file_path = Some(new_data_file_tuple.1);
-            self.curr_file_offset = 0;
+            self.rotate_active_file()?;
+
+            value_position_in_file = 28 + key_as_bytes.len() as u64;
             if let Some(f) = &mut self.curr_file {
                 f.write_all(&data_format)?;
                 self.curr_file_offset += data_format.len() as u64;
@@ -340,8 +354,6 @@ impl KVEngine {
         Ok(())
     }
     fn delete(&mut self, key: &str) -> io::Result<()> {
-        let crc32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
-
         if !self.key_dir.contains_key(key) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Key not found"));
         }
@@ -351,21 +363,27 @@ impl KVEngine {
             .unwrap()
             .as_secs();
 
-        let bytes_to_write: Vec<u8> = [
-            t_stamp.to_le_bytes().as_slice(),
-            key.len().to_le_bytes().as_slice(),
-            &0u64.to_le_bytes(), // 0 means its deleted, flag for stale value
-            key.as_bytes(),
-        ]
-        .concat();
+        let data_format = KVEngine::serialize_record(t_stamp, key.as_bytes(), &[]);
 
-        let checksum = crc32.checksum(&bytes_to_write);
-        let mut data_format = checksum.to_le_bytes().to_vec();
-        data_format.extend(bytes_to_write);
-
-        if let Some(f) = &mut self.curr_file {
-            f.write_all(&data_format)?;
+        if self.curr_file_offset + data_format.len() as u64 <= MAX_FILE_SIZE {
+            if let Some(f) = &mut self.curr_file {
+                f.write_all(&data_format)?;
+                self.curr_file_offset += data_format.len() as u64;
+            } else {
+                self.rotate_active_file()?;
+                if let Some(f) = &mut self.curr_file {
+                    f.write_all(&data_format)?;
+                    self.curr_file_offset += data_format.len() as u64;
+                }
+            }
+        } else {
+            self.rotate_active_file()?;
+            if let Some(f) = &mut self.curr_file {
+                f.write_all(&data_format)?;
+                self.curr_file_offset += data_format.len() as u64;
+            }
         }
+
         self.key_dir.remove(key);
 
         Ok(())
@@ -394,22 +412,21 @@ impl KVEngine {
         if let Some(vec) = self.files.as_ref() {
             let mut fresh_files: Vec<PathBuf> = Vec::new();
 
-            let (new_data_file_tuple, new_hint_file_tuple, mut tstamp) =
-                KVEngine::create_new_file(&self.data_directory)?;
+            let tstamp = KVEngine::new_timestamp();
+            let new_data_file_tuple = KVEngine::create_new_data_file(&self.data_directory, tstamp)?;
+            let new_hint_file_tuple = KVEngine::create_new_hint_file(&self.data_directory, tstamp)?;
 
             let mut fresh_file = BufWriter::with_capacity(256000, new_data_file_tuple.0);
             let mut hint_file = BufWriter::with_capacity(256000, new_hint_file_tuple.0);
             let mut f_name = new_data_file_tuple.1;
-            let mut h_name = new_hint_file_tuple.1;
-            fresh_files.push(PathBuf::from(&f_name));
-            fresh_files.push(PathBuf::from(&h_name));
 
-            // no need to track hint_f_length because its always less than fresh_file
+            fresh_files.push(PathBuf::from(&f_name));
+
             let mut fresh_file_length: u64 = 0;
 
             for path in vec {
                 if Some(path) == self.curr_file_path.as_ref() {
-                    continue; // active file stays shouldn't get touched.
+                    continue; // active file stays shouldnt get touched.
                 }
                 let file_vec = fs::read(path)?;
                 let mut cursor = Cursor::new(file_vec);
@@ -418,7 +435,6 @@ impl KVEngine {
                 let mut value_size = [0u8; 8];
                 let mut crc = [0u8; 4];
 
-                let crc32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
                 let old_file_len = path.metadata()?.len();
                 while cursor.position() < old_file_len {
                     cursor.read_exact(&mut crc)?;
@@ -432,6 +448,7 @@ impl KVEngine {
                     let mut value = vec![0u8; val_size_num];
 
                     cursor.read_exact(&mut key)?;
+                    let old_val_position = cursor.position();
 
                     cursor.read_exact(&mut value)?;
 
@@ -442,18 +459,33 @@ impl KVEngine {
 
                     let crc_from_buff = u32::from_le_bytes(crc);
 
-                    let mut digest = crc32.digest();
-                    digest.update(&timestamp);
-                    digest.update(&key_size);
-                    digest.update(&value_size);
-                    digest.update(&key);
-                    digest.update(&value);
-                    let fresh_crc = digest.finalize();
+                    let fresh_crc = compute_crc(
+                        &timestamp,
+                        &key_size,
+                        &value_size,
+                        key.as_slice(),
+                        value.as_slice(),
+                    );
 
                     if crc_from_buff != fresh_crc {
                         // corrupted dont trust file.
-                        // later we can check if we have a backup for this file and read it from there
+
                         break;
+                    }
+
+                    // problem: if we rewrite a value in our files, and then later it resides in our active file which is not part of files vec.
+                    // when merging, there is not way for me to know whether the value I am adding to keydir is the live version
+                    // example :put("foo", "v1") lands in an old file. Later, put("foo", "v2") lands in the active file. Merge processes
+                    // the old file, writes the stale "v1" to the merged output, and updates the keydir to point there. v2 is unreachable cuz its in the active file
+
+                    //
+                    let should_rewrite = self.key_dir.get(key_as_str).map_or(false, |entry| {
+                        (entry.file_id == path.to_string_lossy().as_ref())
+                            & (entry.value_pos == old_val_position)
+                    });
+
+                    if !should_rewrite {
+                        continue;
                     }
 
                     if val_size_num != 0 {
@@ -467,13 +499,15 @@ impl KVEngine {
                             value.as_slice(),
                         ]
                         .concat();
-
                         let value_position = fresh_file_length + 28 + key_size_num as u64;
+
+                        // [ k_size, key, file_id, value_sz, data_position ]
                         let bytes_to_write_to_hint: Vec<u8> = [
-                            key_size.as_slice(),
+                            &key_size,
                             key.as_slice(),
                             &timestamp,
-                            &fresh_file_length.to_le_bytes(),
+                            &value_size,
+                            &value_position.to_le_bytes(),
                         ]
                         .concat();
 
@@ -494,8 +528,11 @@ impl KVEngine {
                                 },
                             );
                         } else {
-                            let (new_data_file_tuple, new_hint_file_tuple, _) =
-                                KVEngine::create_new_file(&self.data_directory)?;
+                            let tstamp = KVEngine::new_timestamp();
+                            let new_data_file_tuple =
+                                KVEngine::create_new_data_file(&self.data_directory, tstamp)?;
+                            let new_hint_file_tuple =
+                                KVEngine::create_new_hint_file(&self.data_directory, tstamp)?;
 
                             fresh_file.flush()?;
                             hint_file.flush()?;
@@ -505,16 +542,17 @@ impl KVEngine {
                             fresh_file_length = 0;
 
                             f_name = new_data_file_tuple.1;
-                            h_name = new_hint_file_tuple.1;
+                            // h_name = new_hint_file_tuple.1;
                             fresh_files.push(f_name.clone());
-                            fresh_files.push(h_name);
+                            // fresh_files.push(h_name);
 
-                            let value_position = 28 + key_size_num as u64; // file is fresh
+                            let value_position = 28 + key_size_num as u64;
                             let bytes_to_write_to_hint: Vec<u8> = [
                                 key_size.as_slice(),
                                 key.as_slice(),
                                 &timestamp,
-                                &fresh_file_length.to_le_bytes(),
+                                &value_size,
+                                &value_position.to_le_bytes(),
                             ]
                             .concat();
 
@@ -540,8 +578,20 @@ impl KVEngine {
 
                 // delete old file now
                 fs::remove_file(path)?;
+                // delete old hint file too if it exits
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap();
+                let hint_path = self.data_directory.join(format!("{}.hint", stem));
+                if hint_path.exists() {
+                    fs::remove_file(hint_path)?;
+                }
             }
 
+            fresh_file.flush()?;
+            hint_file.flush()?;
             self.files = Some(fresh_files);
         }
 
@@ -556,6 +606,40 @@ impl KVEngine {
         }
 
         Ok(())
+    }
+
+    fn rotate_active_file(&mut self) -> io::Result<()> {
+        if let Some(writer) = &mut self.curr_file {
+            writer.flush()?;
+        }
+        if let Some(old_path) = self.curr_file_path.take() {
+            if let Some(files) = &mut self.files {
+                files.push(old_path);
+            }
+        }
+        let tstamp = KVEngine::new_timestamp();
+        let new_data_file_tuple = KVEngine::create_new_data_file(&self.data_directory, tstamp)?;
+
+        self.curr_file = Some(BufWriter::with_capacity(256000, new_data_file_tuple.0));
+        self.curr_file_path = Some(new_data_file_tuple.1);
+        self.curr_file_offset = 0;
+
+        Ok(())
+    }
+    fn serialize_record(tstamp: u64, key: &[u8], value: &[u8]) -> Vec<u8> {
+        let crc32 = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+        let body: Vec<u8> = [
+            &tstamp.to_le_bytes()[..],
+            &(key.len() as u64).to_le_bytes(),
+            &(value.len() as u64).to_le_bytes(),
+            key,
+            value,
+        ]
+        .concat();
+        let checksum = crc32.checksum(&body);
+        let mut record = checksum.to_le_bytes().to_vec();
+        record.extend(body);
+        record
     }
 
     fn close(&mut self) -> io::Result<()> {
@@ -653,9 +737,12 @@ data format for files:   [ crc | tstamp | ksz | value_sz | key | value ]
       // deleted value format: [ crc | tstamp | ksz | 0u64 | key ]
 
 
-data format for hint files:  [ k_size, key, file_id, data_position ] // file is the timestamp, since we are doing tstamp.data
+data format for hint files:  [ k_size, key, file_id, value_sz, data_position ] // file is the timestamp, since we are doing tstamp.data
 // hint file doesnt actually need file id, because it has the same fileid as the file.data, file.hint file == file
 
 // when rebuilding keydir, we use a hint file if we have one, or use .data. We create hint files on merge
+//  for later : add a crc per hint file, if crc fails, throw hint file away and we remake it later during merge
+// change tstamp to as_nanos? or keep a index to prevent file collision
+//
 
 */
