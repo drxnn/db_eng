@@ -16,3 +16,12 @@ pub fn compute_crc(
     digest.update(value);
     digest.finalize()
 }
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub fn new_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}

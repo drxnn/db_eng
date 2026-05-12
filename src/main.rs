@@ -13,6 +13,11 @@ use crate::helpers::compute_crc;
 use std::cmp::max;
 
 mod helpers;
+mod lsm;
+
+const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024; // SUBJECT TO CHANGE
+const MEMTABLE_THRESHOLD: u64 = 4 * 1024 * 1024; // SUBJECT TO CHANGE
+const DATA_BLOCK: u16 = 8 * 1024; // Data block in SSTable
 struct KeydirEntry {
     file_id: String, // basically file name "timestamp.data"
     value_sz: u64,
@@ -26,34 +31,6 @@ enum SyncConfig {
     Always,     // Ddurable
 }
 
-// AVL notes:
-/*
-balance factor = height_L - height_R
-balance factor = {-1,0,1}, otherwise we balance it
-rotations: if tree is unbalanced, we have to rotate it into balance
-right rotation, left rotation, left right rotation and right left rotation
-how to figure out what rotation to use:
-1. Left-Left Case:
-Occurs when a node is inserted into the left subtree of the left child, causing the balance factor to become more than +1.
-Fix: Perform a single right rotation.
-
-2. Right-Right Case:
-Occurs when a node is inserted into the right subtree of the right child, making the balance factor less than -1.
-Fix: Perform a single left rotation.
-
-3. Left-Right Case:
-Occurs when a node is inserted into the right subtree of the left child, which disturbs the balance factor of an ancestor node, making it left-heavy.
-Fix: Perform a left rotation on the left child, followed by a right rotation on the node.
-
-4. Right-Left Case:
-
-Occurs when a node is inserted into the left subtree of the right child, which disturbs the balance factor of an ancestor node, making it right-heavy.
-Fix: Perform a right rotation on the right child, followed by a left rotation on the node.
-
-
-
-
-*/
 struct AVL {
     root: Option<Node>,
     threshold: u64, // size before we flush it to disk as an sstable file
@@ -70,99 +47,107 @@ struct Node {
     height: u64,
     left: Option<Box<Node>>,
     right: Option<Box<Node>>,
-    bf: i32,
-}
-
-enum RotationKind {
-    LL,
-    RR,
-    LR,
-    RL,
 }
 
 impl AVL {
-    fn new(&mut self, key: &str, value: AvlEntry, threshold: u64) -> Self {
+    fn new(threshold: u64) -> Self {
         Self {
-            root: Some(Node {
-                key: key.to_owned(),
-                value,
-                height: 1,
-                left: None,
-                right: None,
-                bf: 0,
-            }),
+            root: None,
             threshold,
         }
     }
 
-    fn get(&self, key: &str) -> Option<Box<Node>> {
-        unimplemented!()
+    fn get(&self, key: &str) -> Option<&Node> {
+        if let Some(mut curr) = self.root.as_ref() {
+            loop {
+                if curr.key == key {
+                    return Some(curr);
+                }
+                if curr.key.as_str() > key {
+                    curr = curr.left.as_ref()?;
+                } else {
+                    curr = curr.right.as_ref()?;
+                }
+            }
+        } else {
+            None
+        }
     }
 
     fn update_height(node: &mut Box<Node>) {
         let left_height = if let Some(x) = node.left.as_ref() {
-            x.height
+            x.height as i64
         } else {
-            0
+            -1
         };
 
         let right_height = if let Some(x) = node.right.as_ref() {
-            x.height
+            x.height as i64
         } else {
-            0
+            -1
         };
-        node.height = 1 + max(left_height, right_height);
+        node.height = 1 + max(left_height, right_height) as u64;
     }
     fn insert(&mut self, curr: Option<Box<Node>>, n: Node) -> Option<Box<Node>> {
-        // fix unwraps
         if let Some(mut node) = curr {
+            if n.key == node.key {
+                //
+                node.value = n.value;
+                return Some(node);
+            }
             if n.key < node.key {
                 node.left = self.insert(node.left.take(), n);
             } else {
                 node.right = self.insert(node.right.take(), n);
             }
 
-            Self::update_height(&mut node);
-            let bf = Self::compute_balance_factor_of_node(&node);
-
-            if bf > 1 {
-                // left heavy
-
-                let left_node = node.left.as_mut().unwrap();
-                match Self::compute_balance_factor_of_node(&left_node) {
-                    bf if bf >= 0 => {
-                        let left = node.left.take().unwrap();
-
-                        node = Self::right_rotation(node, left);
-                    }
-                    _ => {
-                        let mut left_child = node.left.take().unwrap();
-                        let right_of_left = left_child.right.take().unwrap();
-                        left_child = Self::left_rotation(left_child, right_of_left);
-                        node = Self::right_rotation(node, left_child)
-                    }
-                }
-            } else if bf < -1 {
-                // right heavy
-
-                let right_node = node.right.as_mut().unwrap();
-                match Self::compute_balance_factor_of_node(&right_node) {
-                    bf if bf <= 0 => {
-                        let right = node.right.take().unwrap();
-                        node = Self::left_rotation(node, right);
-                    }
-                    _ => {
-                        let mut right_child = node.right.take().unwrap();
-                        let left_of_right = right_child.left.take().unwrap();
-                        right_child = Self::right_rotation(right_child, left_of_right);
-                        node = Self::left_rotation(node, right_child);
-                    }
-                }
-            }
+            node = Self::balance(node);
             Some(node)
         } else {
-            Some(Box::new(n.clone()))
+            Some(Box::new(n))
         }
+    }
+
+    fn balance(mut node: Box<Node>) -> Box<Node> {
+        Self::update_height(&mut node);
+        let bf = Self::compute_balance_factor_of_node(&node);
+
+        if bf > 1 {
+            // left heavy
+
+            let left_node = node.left.as_mut().unwrap();
+            match Self::compute_balance_factor_of_node(left_node) {
+                bf if bf >= 0 => {
+                    let left = node.left.take().unwrap();
+
+                    node = Self::right_rotation(node, left);
+                }
+                _ => {
+                    let mut left_child = node.left.take().unwrap();
+                    let right_of_left = left_child.right.take().unwrap();
+                    left_child = Self::left_rotation(left_child, right_of_left);
+                    node = Self::right_rotation(node, left_child)
+                }
+            }
+        } else if bf < -1 {
+            // right heavy
+
+            let right_node = node.right.as_mut().unwrap();
+            match Self::compute_balance_factor_of_node(right_node) {
+                bf if bf <= 0 => {
+                    let right = node.right.take().unwrap();
+                    node = Self::left_rotation(node, right);
+                }
+                _ => {
+                    let mut right_child = node.right.take().unwrap();
+                    let left_of_right = right_child.left.take().unwrap();
+                    right_child = Self::right_rotation(right_child, left_of_right);
+                    node = Self::left_rotation(node, right_child);
+                }
+            }
+        }
+
+        node
     }
 
     fn left_rotation(mut parent: Box<Node>, mut child: Box<Node>) -> Box<Node> {
@@ -201,8 +186,63 @@ impl AVL {
         };
         bf_l - bf_r
     }
-    fn delete(&mut self, n: Node) -> io::Result<()> {
-        Ok(())
+    fn take_min(mut curr: Box<Node>) -> (Option<Box<Node>>, Option<Box<Node>>) {
+        // in order successor.
+        // we have passed the right child here
+        // go left till the end
+
+        // None
+        if curr.left.is_none() {
+            let right = curr.right.take();
+            return (Some(curr), right);
+        }
+
+        let (min_node, left_node) = Self::take_min(curr.left.take().unwrap());
+        curr.left = left_node;
+        (min_node, Some(Self::balance(curr)))
+    }
+    fn delete(&mut self, curr: Option<Box<Node>>, key: &str) -> Option<Box<Node>> {
+        if let Some(mut node) = curr {
+            if node.key == key {
+                if node.left.is_none() && node.right.is_none() {
+                    return None;
+                } else if node.right.is_some() != node.left.is_some() {
+                    // XOR
+                    // return the child
+                    if let Some(_x) = node.left.as_ref() {
+                        return node.left;
+                    } else {
+                        return node.right;
+                    }
+                } else {
+                    // safe to unwrap here
+                    let (successor, new_right) = Self::take_min(node.right.take().unwrap());
+                    {
+                        let succ = successor.unwrap();
+                        node.right = new_right;
+                        node.value = succ.value;
+                        node.key = succ.key;
+                    }
+                }
+                return Some(Self::balance(node));
+            }
+
+            if node.key.as_str() < key {
+                node.right = self.delete(node.right.take(), key);
+            } else {
+                node.left = self.delete(node.left.take(), key);
+            }
+            Some(Self::balance(node))
+        } else {
+            curr
+        }
+    }
+    fn serialize_sstable_metadata() {
+        unimplemented!();
+    }
+
+    fn build_bloom_filter_on_flush() {
+        unimplemented!();
     }
 }
 struct KVEngine {
@@ -211,10 +251,11 @@ struct KVEngine {
     key_dir: HashMap<String, KeydirEntry>,
     curr_file: Option<BufWriter<File>>, // have a curr file to be the file you are currently writing on
     curr_file_path: Option<PathBuf>,
-    curr_file_offset: u64, // and a cursor
+    curr_file_offset: u64,
     sync_config: SyncConfig,
+    memtable: AVL,
 }
-const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1gb per file
+
 impl KVEngine {
     fn new_timestamp() -> u64 {
         SystemTime::now()
@@ -227,7 +268,6 @@ impl KVEngine {
         let data_file_path = dir.join(format!("{}.data", tstamp));
         let data_file = OpenOptions::new()
             .read(true)
-            .write(true)
             .append(true)
             .create(true)
             .open(&data_file_path)?;
@@ -238,19 +278,12 @@ impl KVEngine {
         let hint_file_path = dir.join(format!("{}.hint", tstamp));
         let hint_file = OpenOptions::new()
             .read(true)
-            .write(true)
             .append(true)
             .create(true)
             .open(&hint_file_path)?;
         Ok((hint_file, hint_file_path))
     }
 
-    fn build_key_dir_from_file(
-        keydir: HashMap<String, KeydirEntry>,
-    ) -> HashMap<String, KeydirEntry> {
-        unimplemented!()
-        // move keydir to function, function adds to it and gives it back to caller
-    }
     fn open(dir_name: &Path, sync_config: SyncConfig) -> io::Result<KVEngine> {
         let path = PathBuf::from(dir_name);
         let mut key_dir: HashMap<String, KeydirEntry> = HashMap::new();
@@ -417,6 +450,7 @@ impl KVEngine {
             }
         }
 
+        let memtable = AVL::new(MEMTABLE_THRESHOLD);
         let mut self_instance = Self {
             data_directory: path,
             key_dir,
@@ -425,6 +459,7 @@ impl KVEngine {
             curr_file_path: None,
             curr_file_offset: 0,
             sync_config,
+            memtable,
         };
 
         if let Some(f) = files.last() {
@@ -436,7 +471,6 @@ impl KVEngine {
                     .create(true)
                     .append(true)
                     .read(true)
-                    .write(true)
                     .open(f)?;
 
                 self_instance.curr_file = Some(BufWriter::with_capacity(256000, file));
@@ -462,7 +496,7 @@ impl KVEngine {
         let value_position = key_info.value_pos;
         let value_size = key_info.value_sz;
 
-        let mut f: File = fs::File::open(file_to_open)?; // opening file on every get, optimize later 
+        let mut f: File = fs::File::open(file_to_open)?; // opening file on every get, optimize later
         let mut data = vec![0; value_size as usize];
 
         f.seek(SeekFrom::Start(value_position))?;
@@ -824,6 +858,10 @@ impl KVEngine {
         record
     }
 
+    fn deserialize_record() {
+        unimplemented!();
+    }
+
     fn close(&mut self) -> io::Result<()> {
         self.sync()?;
 
@@ -842,7 +880,7 @@ mod tests {
         let dir = tempdir()?;
         let mut db = KVEngine::open(dir.path(), SyncConfig::None)?;
         db.put("hello", b"world")?;
-        db.sync()?; // make sure we put the data in there 
+        db.sync()?; // make sure we put the data in there
         assert_eq!(db.get("hello")?, b"world");
         Ok(())
     }
@@ -914,48 +952,3 @@ mod tests {
 
     /*AVL Tree tests, insertion, deletion, rotations */
 }
-
-/*
-=============================================================================
-IMPLEMENTATION NOTES
-=============================================================================
-
-DATA FORMATS
-------------
-Data file:   [ crc(4) | tstamp(8) | ksz(8) | value_sz(8) | key | value ]
-Tombstone:   [ crc(4) | tstamp(8) | ksz(8) | 0u64(8)     | key         ]
-
-Hint file:   [ ksz(8) | key | tstamp(8) | value_sz(8) | data_position(8) ]
-  - No file_id needed: hint and data files share the same timestamp stem.
-  - Created during merge for faster keydir rebuilds on startup.
-  - On open: use hint file if present, fall back to scanning the .data file.
-
-KEYDIR REBUILD
---------------
-  - Files processed in ascending timestamp order.
-  - value_sz == 0 signals a deleted key — remove from keydir.
-
-=============================================================================
-NEXT STEPS
-=============================================================================
-
-1. SSTable
-   - Memtable backed by an AVL (sorted by key).
-   - On flush: iterate in order, write an immutable SSTable file:
-       [ data blocks(same format as above except now they are sorted) | sparse index(do 8000 bytes per index) | bloom filter | footer ]
-   - WAL: append every write to disk before inserting into the memtable.
-     Use the same SyncConfig logic for fsync strategy. Discard WAL after flush.
-   - Bloom filter: k-hash bit array per SSTable to skip files on negative lookups.
-
-   Explanation of data blocks: they are approximately 8kb, obviously we can have a data block thats 100 kb on its own
-   so the way it works is when we write data, we keep writing until we hit our threshold 8kb, after we pass that threshold,
-   we write the index to point to the next data block.
-   So keep a hashmap of (key, offset) till the end of the file.
-
-2. LSM Tree
-   - Layer multiple SSTables with leveled or tiered compaction.
-   - Compaction merges sorted SSTable files (merge sort), dropping stale/deleted keys.
-   - Reads check memtable first, then SSTables newest-to-oldest.
-
-=============================================================================
-*/
