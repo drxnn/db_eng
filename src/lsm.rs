@@ -89,12 +89,11 @@ struct AVL {
 }
 #[derive(PartialEq, Clone, Debug)]
 struct AvlEntry {
-    value: String,
-    deleted: bool,
+    value: Vec<u8>,
 }
 #[derive(PartialEq, Clone, Debug)]
 struct Node {
-    key: String,
+    key: Vec<u8>,
     value: AvlEntry,
     height: u64,
     left: Option<Box<Node>>,
@@ -109,13 +108,13 @@ impl AVL {
         }
     }
 
-    fn get(&self, key: &str) -> Option<&Node> {
+    fn get(&self, key: &[u8]) -> Option<&[u8]> {
         if let Some(mut curr) = self.root.as_ref() {
             loop {
                 if curr.key == key {
-                    return Some(curr);
+                    return Some(&curr.value.value);
                 }
-                if curr.key.as_str() > key {
+                if curr.key.as_slice() > key {
                     curr = curr.left.as_ref()?;
                 } else {
                     curr = curr.right.as_ref()?;
@@ -253,7 +252,7 @@ impl AVL {
         curr.left = left_node;
         (min_node, Some(Self::balance(curr)))
     }
-    fn delete(&mut self, curr: Option<Box<Node>>, key: &str) -> Option<Box<Node>> {
+    fn delete(&mut self, curr: Option<Box<Node>>, key: &[u8]) -> Option<Box<Node>> {
         if let Some(mut node) = curr {
             if node.key == key {
                 if node.left.is_none() && node.right.is_none() {
@@ -279,7 +278,7 @@ impl AVL {
                 return Some(Self::balance(node));
             }
 
-            if node.key.as_str() < key {
+            if node.key.as_slice() < key {
                 node.right = self.delete(node.right.take(), key);
             } else {
                 node.left = self.delete(node.left.take(), key);
@@ -329,7 +328,6 @@ impl KVEngine {
     // threshold and sync_config can be part of one config struct later.
     fn open(dir_name: &Path, sync_config: SyncConfig, threshold: u64) -> io::Result<KVEngine> {
         let path = PathBuf::from(dir_name);
-        // Fetch WAL, if theres anything on it, add it to SStable
 
         let mut sstables: Vec<SSTable> = Vec::new();
 
@@ -396,9 +394,23 @@ impl KVEngine {
         Ok(self_instance)
     }
 
-    fn get(&self, key: &[u8]) -> io::Result<Vec<u8>> {
+    fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
         // check AVL tree first, if found, return, otherwise consult the SStables
         unimplemented!()
+        // Steps
+        /* Check AVL tree -> if there return
+        else -> while loop check SS tables, if min/max or bloom filter say negative skip -> otherwise binary search Datablocks
+        when found return, or None
+        */
+        let val = self.memtable.get(key);
+        if let Some(c) = val {
+            return Some(Ok(c.to_vec()));
+        } else {
+            // search ss tables
+        }
+    }
+    fn binary_search_sstable() -> Option<Vec<u8>> {
+        unimplemented!();
     }
     fn sync(&mut self) -> io::Result<()> {
         // forces any writes to sync to disk
@@ -456,7 +468,13 @@ Bloom filter: k-hash bit array per SSTable to skip files on negative lookups. Us
 /*
 TODOS:
 Build SSTables on open to have the metadata in memory.
-
+Need to rewrite the delete function. Right now I am removing the Node from the tree but this can cause a bug:
+if you delete a key thats in the memtable, you remove the node, but what if its in one of the SStables?
+since the memtable hasnt been flushed yet, you will check memtable -> not found then check ss table and return the value even though 
+it was deleted.
+So instead of removing the node, just add a tombstone on deletes. this means that the tree will just grow and now need to rebalance on deletes.
+On delete: just do insert(key, node) and have node.deleted true
+On KVEngine get() you check if a kv is in the memtable, if yes, check the deleted flag.
 
 
 
