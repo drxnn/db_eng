@@ -1,5 +1,6 @@
 use crc::{CRC_32_ISO_HDLC, Crc};
-
+use xxhash_rust::xxh3::xxh3_128;
+pub const NUM_HASHES: usize = 7;
 pub fn compute_crc(
     timestamp: &[u8; 8],
     key_size: &[u8; 8],
@@ -17,6 +18,13 @@ pub fn compute_crc(
     digest.finalize()
 }
 
+pub fn compute_crc_data_block(data: &[u8]) -> u32 {
+    let crc32 = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+    let mut digest = crc32.digest();
+    digest.update(data);
+    digest.finalize()
+}
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn new_timestamp() -> u64 {
@@ -24,4 +32,17 @@ pub fn new_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u64
+}
+
+pub fn get_hashed_key_positions(key: &[u8]) -> [u64; NUM_HASHES] {
+    let h_key = xxh3_128(key);
+    let h1 = (h_key >> 64) as u64;
+    let h2 = h_key as u64;
+
+    let mut arr: [u64; NUM_HASHES] = [0; NUM_HASHES];
+    for i in 0..NUM_HASHES {
+        arr[i] = h1.wrapping_add(i as u64).wrapping_mul(h2);
+    }
+
+    arr
 }

@@ -1,7 +1,7 @@
 use crc::{CRC_32_ISO_HDLC, Crc};
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::mem;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
@@ -9,8 +9,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::helpers::{compute_crc, new_timestamp};
-use std::cmp::max;
+use crate::helpers::{
+    NUM_HASHES, compute_crc, compute_crc_data_block, get_hashed_key_positions, new_timestamp,
+};
+use std::cmp::{Ordering, max};
 
 const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024; // SUBJECT TO CHANGE
 const MEMTABLE_THRESHOLD: u64 = 4 * 1024 * 1024; // SUBJECT TO CHANGE
@@ -28,7 +30,6 @@ enum SyncConfig {
 struct BloomFilter {
     bits: Vec<u64>,
     num_bits: u64,
-    num_hashes: u16,
 }
 
 struct WAL {
@@ -71,9 +72,10 @@ struct SSTable {
     id: u64,
     file: File,
     file_path: PathBuf,
+    file_size: u64,
     min_key: Vec<u8>,
     max_key: Vec<u8>,
-    sparse_index: Vec<(Vec<u8>, u64)>,
+    sparse_index: Vec<(Vec<u8>, u64, u64)>, // key | offset | datablock block length ( before CRC, which means you need to read the next 4 bytes and compute the crc)
     bloom_filter: BloomFilter,
 }
 
@@ -82,14 +84,47 @@ impl SSTable {
     fn load(path: &Path) -> Self {
         unimplemented!()
     }
+
+    fn binary_search_sparse_index(&self, key: &[u8]) -> Option<(u64, u64)> {
+        // first u64 is the offset, the second is the datablock size
+        if self.sparse_index.is_empty() {
+            return None;
+        }
+
+        let mut lo: i64 = 0;
+        let mut hi: i64 = (self.sparse_index.len() - 1) as i64;
+
+        let mut best_candidate: Option<(u64, u64)> = None;
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.sparse_index.get(mid as usize) {
+                Some(entry) => {
+                    let key_in_index = entry.0.as_slice();
+                    if key_in_index < key {
+                        best_candidate = Some((entry.1, entry.2));
+                        lo = mid + 1;
+                    } else if key_in_index > key {
+                        hi = mid - 1;
+                    } else {
+                        // if key is equal just return the offset
+                        return Some((entry.1, entry.2));
+                    }
+                }
+                None => unreachable!(),
+            }
+        }
+
+        best_candidate
+    }
 }
 struct AVL {
-    root: Option<Node>,
+    root: Option<Box<Node>>,
     threshold: u64,
 }
 #[derive(PartialEq, Clone, Debug)]
 struct AvlEntry {
     value: Vec<u8>,
+    deleted: bool,
 }
 #[derive(PartialEq, Clone, Debug)]
 struct Node {
@@ -142,7 +177,6 @@ impl AVL {
     fn insert(&mut self, curr: Option<Box<Node>>, n: Node) -> Option<Box<Node>> {
         if let Some(mut node) = curr {
             if n.key == node.key {
-                //
                 node.value = n.value;
                 return Some(node);
             }
@@ -252,7 +286,23 @@ impl AVL {
         curr.left = left_node;
         (min_node, Some(Self::balance(curr)))
     }
-    fn delete(&mut self, curr: Option<Box<Node>>, key: &[u8]) -> Option<Box<Node>> {
+
+    fn delete(&mut self, key: &[u8]) {
+        let node = Node {
+            key: key.to_vec(),
+            value: AvlEntry {
+                value: Vec::new(),
+                deleted: true,
+            },
+            height: 1,
+            left: None,
+            right: None,
+        };
+
+        let root = self.root.take();
+        self.root = self.insert(root, node);
+    }
+    fn delete_remove_node(&mut self, curr: Option<Box<Node>>, key: &[u8]) -> Option<Box<Node>> {
         if let Some(mut node) = curr {
             if node.key == key {
                 if node.left.is_none() && node.right.is_none() {
@@ -279,9 +329,9 @@ impl AVL {
             }
 
             if node.key.as_slice() < key {
-                node.right = self.delete(node.right.take(), key);
+                node.right = self.delete_remove_node(node.right.take(), key);
             } else {
-                node.left = self.delete(node.left.take(), key);
+                node.left = self.delete_remove_node(node.left.take(), key);
             }
             Some(Self::balance(node))
         } else {
@@ -394,19 +444,108 @@ impl KVEngine {
         Ok(self_instance)
     }
 
-    fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
-        // check AVL tree first, if found, return, otherwise consult the SStables
-        unimplemented!()
-        // Steps
-        /* Check AVL tree -> if there return
-        else -> while loop check SS tables, if min/max or bloom filter say negative skip -> otherwise binary search Datablocks
-        when found return, or None
-        */
+    fn should_search_sstable_file(key: &[u8], sstable: &SSTable) -> bool {
+        // checks the metadata of sstable and tells us whether we should look for the kv in the sstable
+        if key > sstable.max_key.as_slice() || key < sstable.min_key.as_slice() {
+            return false;
+        }
+        let bf_bit_positions = get_hashed_key_positions(key);
+        bf_bit_positions
+            .iter()
+            .all(|&pos| *sstable.bloom_filter.bits.get(pos as usize).unwrap_or(&0) != 0)
+    }
+
+    //[ tstamp(8) | ksz(8) | value_sz(8) | key | value  tstamp(8) | ksz(8) | value_sz(8) | key | value ... crc(4)]
+    fn search_for_kv_in_sstables(&mut self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        if let Some(sstables) = &self.sstables {
+            for curr_sstable in sstables.iter() {
+                match Self::should_search_sstable_file(key, curr_sstable) {
+                    true => {
+                        let Some((offset, data_len)) = curr_sstable.binary_search_sparse_index(key)
+                        else {
+                            continue;
+                        };
+
+                        let mut data_buffer = vec![0u8; data_len as usize];
+                        let mut crc = [0u8; 4];
+
+                        let mut reader = BufReader::new(&curr_sstable.file);
+                        reader.seek(SeekFrom::Start(offset))?;
+
+                        reader.read_exact(&mut data_buffer)?;
+                        reader.read_exact(&mut crc)?;
+                        let crc_from_buff = u32::from_le_bytes(crc);
+
+                        let fresh_crc = compute_crc_data_block(&data_buffer);
+
+                        if fresh_crc != crc_from_buff {
+                            break; // 
+                            //
+                            // NEED TO RETURN ERROR HERE
+                            // ALSO REMOVE FILE ITS CORRUPTED
+                            //
+                        }
+
+                        let mut data_reader: &[u8] = &data_buffer;
+                        let mut timestamp = [0u8; 8];
+                        let mut key_size = [0u8; 8];
+                        let mut value_size = [0u8; 8];
+
+                        let mut pos = 0;
+                        while pos < data_buffer.len() {
+                            if pos + 24 > data_buffer.len() {
+                                // ERROR SOMETHING WENT WRONG
+                                // THROW SS TABLE OUT
+                            }
+                            //[ tstamp(8) | ksz(8) | value_sz(8) | key | value  tstamp(8) | ksz(8) | value_sz(8) | key | value ... crc(4)]
+                            //
+                            let ksz = u64::from_le_bytes(
+                                data_buffer[pos + 8..pos + 16].try_into().unwrap(),
+                            ) as usize;
+                            let vsz = u64::from_le_bytes(
+                                data_buffer[pos + 16..pos + 24].try_into().unwrap(),
+                            ) as usize;
+
+                            let key_start = pos + 24;
+                            let val_start = pos + 24 + ksz;
+                            let val_end = val_start + vsz;
+                            let curr_key = &data_buffer[key_start..val_start];
+                            let value: &[u8] = &data_buffer[val_start..val_end];
+
+                            match curr_key.cmp(key) {
+                                Ordering::Less => {
+                                    pos = val_end;
+                                    continue;
+                                }
+                                Ordering::Equal => {
+                                    // here you also need to check whether the value was deleted
+                                    // so check if value size == 0, or add an actual tombstone(1 byte);
+                                    if vsz == 0 {
+                                        // return that this has been deleted. But change deleted to have an actual flag(1 byte).
+                                    }
+                                    return Ok(Some(value.to_vec()));
+                                }
+                                Ordering::Greater => break,
+                            }
+                            // match
+                        }
+                    }
+                    false => continue,
+                }
+            }
+        };
+        Ok(None)
+    }
+
+    fn get(&mut self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
         let val = self.memtable.get(key);
         if let Some(c) = val {
-            return Some(Ok(c.to_vec()));
+            Ok(Some(c.to_vec()))
         } else {
-            // search ss tables
+            match self.search_for_kv_in_sstables(key)? {
+                Some(v) => Ok(Some(v)),
+                _ => Ok(None),
+            }
         }
     }
     fn binary_search_sstable() -> Option<Vec<u8>> {
@@ -465,17 +604,18 @@ DataBlocks:  [ tstamp(8) | ksz(8) | value_sz(8) | key | value  tstamp(8) | ksz(8
 SSTable: Datablock1 | DataBlock2 ... Datablock N | Footer
 Bloom filter: k-hash bit array per SSTable to skip files on negative lookups. Use 10 bits per key. Built during flush of AVL.
 */
+// SparseIndex => [firskey:offset]
 /*
 TODOS:
 Build SSTables on open to have the metadata in memory.
 Need to rewrite the delete function. Right now I am removing the Node from the tree but this can cause a bug:
 if you delete a key thats in the memtable, you remove the node, but what if its in one of the SStables?
-since the memtable hasnt been flushed yet, you will check memtable -> not found then check ss table and return the value even though 
+since the memtable hasnt been flushed yet, you will check memtable -> not found then check ss table and return the value even though
 it was deleted.
 So instead of removing the node, just add a tombstone on deletes. this means that the tree will just grow and now need to rebalance on deletes.
-On delete: just do insert(key, node) and have node.deleted true
-On KVEngine get() you check if a kv is in the memtable, if yes, check the deleted flag.
+On delete: just do insert(key, node) and have node.deleted true.
 
+On KVEngine get() you check if a kv is in the memtable, if yes, check the deleted flag.
 
 
 */
