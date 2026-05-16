@@ -12,6 +12,7 @@ use std::{
 use crate::helpers::compute_crc;
 use std::cmp::max;
 
+mod errors;
 mod helpers;
 mod lsm;
 

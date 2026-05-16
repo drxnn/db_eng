@@ -358,13 +358,6 @@ struct KVEngine {
 }
 
 impl KVEngine {
-    fn new_timestamp() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64
-    }
-
     fn create_new_data_file(dir: &Path, tstamp: u64) -> io::Result<(File, PathBuf)> {
         let data_file_path = dir.join(format!("{}.data", tstamp));
         let data_file = OpenOptions::new()
@@ -449,10 +442,11 @@ impl KVEngine {
         if key > sstable.max_key.as_slice() || key < sstable.min_key.as_slice() {
             return false;
         }
-        let bf_bit_positions = get_hashed_key_positions(key);
+        let bf_size = sstable.bloom_filter.bits.len();
+        let bf_bit_positions = get_hashed_key_positions(key, bf_size);
         bf_bit_positions
             .iter()
-            .all(|&pos| *sstable.bloom_filter.bits.get(pos as usize).unwrap_or(&0) != 0)
+            .all(|&pos| *sstable.bloom_filter.bits.get(pos).unwrap() != 0)
     }
 
     //[ tstamp(8) | ksz(8) | value_sz(8) | key | value  tstamp(8) | ksz(8) | value_sz(8) | key | value ... crc(4)]
@@ -486,14 +480,9 @@ impl KVEngine {
                             //
                         }
 
-                        let mut data_reader: &[u8] = &data_buffer;
-                        let mut timestamp = [0u8; 8];
-                        let mut key_size = [0u8; 8];
-                        let mut value_size = [0u8; 8];
-
                         let mut pos = 0;
                         while pos < data_buffer.len() {
-                            if pos + 24 > data_buffer.len() {
+                            if pos + 25 > data_buffer.len() {
                                 // ERROR SOMETHING WENT WRONG
                                 // THROW SS TABLE OUT
                             }
@@ -505,9 +494,10 @@ impl KVEngine {
                             let vsz = u64::from_le_bytes(
                                 data_buffer[pos + 16..pos + 24].try_into().unwrap(),
                             ) as usize;
-
-                            let key_start = pos + 24;
-                            let val_start = pos + 24 + ksz;
+                            let deleted = &data_buffer[pos + 24..pos + 25][0];
+                            // [ tstamp(8) | ksz(8) | value_sz(8) | deletedflag(1) | key | value ]
+                            let key_start = pos + 25;
+                            let val_start = key_start + ksz;
                             let val_end = val_start + vsz;
                             let curr_key = &data_buffer[key_start..val_start];
                             let value: &[u8] = &data_buffer[val_start..val_end];
@@ -520,14 +510,14 @@ impl KVEngine {
                                 Ordering::Equal => {
                                     // here you also need to check whether the value was deleted
                                     // so check if value size == 0, or add an actual tombstone(1 byte);
-                                    if vsz == 0 {
-                                        // return that this has been deleted. But change deleted to have an actual flag(1 byte).
+                                    if *deleted == 1 {
+                                        // it has been deleted so return None
+                                        return Ok(None);
                                     }
                                     return Ok(Some(value.to_vec()));
                                 }
                                 Ordering::Greater => break,
                             }
-                            // match
                         }
                     }
                     false => continue,
@@ -548,9 +538,7 @@ impl KVEngine {
             }
         }
     }
-    fn binary_search_sstable() -> Option<Vec<u8>> {
-        unimplemented!();
-    }
+
     fn sync(&mut self) -> io::Result<()> {
         // forces any writes to sync to disk
         if let Some(writer) = &mut self.curr_file_buffer {
@@ -572,7 +560,7 @@ impl KVEngine {
             let sstable = SSTable::load(&old_path);
             files.push(sstable);
         }
-        let tstamp = KVEngine::new_timestamp();
+        let tstamp = new_timestamp();
         let new_data_file_tuple = KVEngine::create_new_data_file(&self.data_directory, tstamp)?;
 
         self.curr_file_buffer = Some(BufWriter::with_capacity(256000, new_data_file_tuple.0));
@@ -604,7 +592,8 @@ DataBlocks:  [ tstamp(8) | ksz(8) | value_sz(8) | key | value  tstamp(8) | ksz(8
 SSTable: Datablock1 | DataBlock2 ... Datablock N | Footer
 Bloom filter: k-hash bit array per SSTable to skip files on negative lookups. Use 10 bits per key. Built during flush of AVL.
 */
-// SparseIndex => [firskey:offset]
+// SparseIndex => [ firskey:[offset, datablock_length] ]
+
 /*
 TODOS:
 Build SSTables on open to have the metadata in memory.
@@ -616,6 +605,7 @@ So instead of removing the node, just add a tombstone on deletes. this means tha
 On delete: just do insert(key, node) and have node.deleted true.
 
 On KVEngine get() you check if a kv is in the memtable, if yes, check the deleted flag.
-
+[ tstamp(8) | ksz(8) | value_sz(8) | deletedflag(1) | key | value ]
+deletedflag 1 = deleted, 0 = alive
 
 */

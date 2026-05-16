@@ -34,14 +34,14 @@ pub fn new_timestamp() -> u64 {
         .as_nanos() as u64
 }
 
-pub fn get_hashed_key_positions(key: &[u8]) -> [u64; NUM_HASHES] {
+pub fn get_hashed_key_positions(key: &[u8], bloom_filter_size: usize) -> [usize; NUM_HASHES] {
     let h_key = xxh3_128(key);
     let h1 = (h_key >> 64) as u64;
     let h2 = h_key as u64;
 
-    let mut arr: [u64; NUM_HASHES] = [0; NUM_HASHES];
+    let mut arr: [usize; NUM_HASHES] = [0; NUM_HASHES];
     for i in 0..NUM_HASHES {
-        arr[i] = h1.wrapping_add(i as u64).wrapping_mul(h2);
+        arr[i] = h1.wrapping_add(i as u64).wrapping_mul(h2) as usize % bloom_filter_size;
     }
 
     arr
