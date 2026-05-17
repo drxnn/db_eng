@@ -1,5 +1,6 @@
 use crc::{CRC_32_ISO_HDLC, Crc};
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::mem;
@@ -9,6 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::errors::{CorruptionType, DataCorruptedErr, DbError, Result};
 use crate::helpers::{
     NUM_HASHES, compute_crc, compute_crc_data_block, get_hashed_key_positions, new_timestamp,
 };
@@ -31,6 +33,8 @@ struct BloomFilter {
     bits: Vec<u64>,
     num_bits: u64,
 }
+
+struct FileId(u64);
 
 struct WAL {
     wal_writer: Option<BufWriter<File>>,
@@ -77,6 +81,7 @@ struct SSTable {
     max_key: Vec<u8>,
     sparse_index: Vec<(Vec<u8>, u64, u64)>, // key | offset | datablock block length ( before CRC, which means you need to read the next 4 bytes and compute the crc)
     bloom_filter: BloomFilter,
+    corrupted: bool,
 }
 
 impl SSTable {
@@ -106,7 +111,6 @@ impl SSTable {
                     } else if key_in_index > key {
                         hi = mid - 1;
                     } else {
-                        // if key is equal just return the offset
                         return Some((entry.1, entry.2));
                     }
                 }
@@ -355,6 +359,7 @@ struct KVEngine {
     sync_config: SyncConfig,
     wal: WAL,
     memtable: AVL,
+    corrupted_files: HashSet<FileId>,
 }
 
 impl KVEngine {
@@ -369,7 +374,7 @@ impl KVEngine {
     }
 
     // threshold and sync_config can be part of one config struct later.
-    fn open(dir_name: &Path, sync_config: SyncConfig, threshold: u64) -> io::Result<KVEngine> {
+    fn open(dir_name: &Path, sync_config: SyncConfig, threshold: u64) -> Result<KVEngine> {
         let path = PathBuf::from(dir_name);
 
         let mut sstables: Vec<SSTable> = Vec::new();
@@ -397,13 +402,6 @@ impl KVEngine {
         let memtable = AVL::new(MEMTABLE_THRESHOLD);
 
         let wal_path = dir_name.join("walfile.wal");
-        if let Ok(wal_m) = wal_path.metadata()
-            && wal_m.len() > 0
-        {
-
-            // flush to disk
-            // TODO
-        }
 
         let wal = WAL::new(threshold, sync_config)?;
 
@@ -416,7 +414,13 @@ impl KVEngine {
             sync_config,
             memtable,
             wal,
+            corrupted_files: HashSet::new(),
         };
+        if let Ok(wal_m) = wal_path.metadata()
+            && wal_m.len() > 0
+        {
+            self_instance.sync_wal()?;
+        }
 
         if let Some(active_sstable) = sstables.pop() {
             let ss_metadata = active_sstable.file.metadata()?;
@@ -450,84 +454,106 @@ impl KVEngine {
     }
 
     //[ tstamp(8) | ksz(8) | value_sz(8) | key | value  tstamp(8) | ksz(8) | value_sz(8) | key | value ... crc(4)]
-    fn search_for_kv_in_sstables(&mut self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
-        if let Some(sstables) = &self.sstables {
-            for curr_sstable in sstables.iter() {
-                match Self::should_search_sstable_file(key, curr_sstable) {
-                    true => {
-                        let Some((offset, data_len)) = curr_sstable.binary_search_sparse_index(key)
-                        else {
-                            continue;
-                        };
-
-                        let mut data_buffer = vec![0u8; data_len as usize];
-                        let mut crc = [0u8; 4];
-
-                        let mut reader = BufReader::new(&curr_sstable.file);
-                        reader.seek(SeekFrom::Start(offset))?;
-
-                        reader.read_exact(&mut data_buffer)?;
-                        reader.read_exact(&mut crc)?;
-                        let crc_from_buff = u32::from_le_bytes(crc);
-
-                        let fresh_crc = compute_crc_data_block(&data_buffer);
-
-                        if fresh_crc != crc_from_buff {
-                            break; // 
-                            //
-                            // NEED TO RETURN ERROR HERE
-                            // ALSO REMOVE FILE ITS CORRUPTED
-                            //
-                        }
-
-                        let mut pos = 0;
-                        while pos < data_buffer.len() {
-                            if pos + 25 > data_buffer.len() {
-                                // ERROR SOMETHING WENT WRONG
-                                // THROW SS TABLE OUT
-                            }
-                            //[ tstamp(8) | ksz(8) | value_sz(8) | key | value  tstamp(8) | ksz(8) | value_sz(8) | key | value ... crc(4)]
-                            //
-                            let ksz = u64::from_le_bytes(
-                                data_buffer[pos + 8..pos + 16].try_into().unwrap(),
-                            ) as usize;
-                            let vsz = u64::from_le_bytes(
-                                data_buffer[pos + 16..pos + 24].try_into().unwrap(),
-                            ) as usize;
-                            let deleted = &data_buffer[pos + 24..pos + 25][0];
-                            // [ tstamp(8) | ksz(8) | value_sz(8) | deletedflag(1) | key | value ]
-                            let key_start = pos + 25;
-                            let val_start = key_start + ksz;
-                            let val_end = val_start + vsz;
-                            let curr_key = &data_buffer[key_start..val_start];
-                            let value: &[u8] = &data_buffer[val_start..val_end];
-
-                            match curr_key.cmp(key) {
-                                Ordering::Less => {
-                                    pos = val_end;
-                                    continue;
-                                }
-                                Ordering::Equal => {
-                                    // here you also need to check whether the value was deleted
-                                    // so check if value size == 0, or add an actual tombstone(1 byte);
-                                    if *deleted == 1 {
-                                        // it has been deleted so return None
-                                        return Ok(None);
-                                    }
-                                    return Ok(Some(value.to_vec()));
-                                }
-                                Ordering::Greater => break,
-                            }
-                        }
-                    }
-                    false => continue,
-                }
-            }
+    fn search_kv_in_sstable(&mut self, sstable: &SSTable, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let Some((offset, data_len)) = sstable.binary_search_sparse_index(key) else {
+            return Ok(None);
         };
+        let mut data_buffer = vec![0u8; data_len as usize];
+        let mut crc = [0u8; 4];
+
+        let mut reader = BufReader::new(&sstable.file);
+        reader.seek(SeekFrom::Start(offset))?;
+
+        reader.read_exact(&mut data_buffer)?;
+        reader.read_exact(&mut crc)?;
+        let crc_from_buff = u32::from_le_bytes(crc);
+
+        let fresh_crc = compute_crc_data_block(&data_buffer);
+
+        if fresh_crc != crc_from_buff {
+            return Err(DbError::DataCorrupted(DataCorruptedErr {
+                offset,
+                file_path: sstable.file_path.clone(),
+                reason: CorruptionType::CrcMismatch {
+                    expected: crc_from_buff,
+                    found: fresh_crc,
+                },
+            }));
+        }
+
+        let mut pos = 0;
+        while pos < data_buffer.len() {
+            if pos + 25 > data_buffer.len() {
+                return Err(DbError::DataCorrupted(DataCorruptedErr {
+                    offset: offset + pos as u64,
+                    file_path: sstable.file_path.clone(),
+                    reason: CorruptionType::Other(format!(
+                        "truncated record header at buffer position {} (buffer len {})",
+                        pos,
+                        data_buffer.len(),
+                    )),
+                }));
+            }
+            //[ tstamp(8) | ksz(8) | value_sz(8) | key | value  tstamp(8) | ksz(8) | value_sz(8) | key | value ... crc(4)]
+            //
+            let ksz =
+                u64::from_le_bytes(data_buffer[pos + 8..pos + 16].try_into().unwrap()) as usize;
+            let vsz =
+                u64::from_le_bytes(data_buffer[pos + 16..pos + 24].try_into().unwrap()) as usize;
+            let deleted = &data_buffer[pos + 24..pos + 25][0];
+            // [ tstamp(8) | ksz(8) | value_sz(8) | deletedflag(1) | key | value ]
+            // check ksz and vsz doesnt overflow
+            let key_start = pos + 25;
+
+            let val_end = key_start
+                .checked_add(ksz)
+                .and_then(|v| v.checked_add(vsz))
+                .ok_or_else(|| {
+                    DbError::DataCorrupted(DataCorruptedErr {
+                        offset: offset + pos as u64,
+                        file_path: sstable.file_path.clone(),
+                        reason: CorruptionType::Other(format!(
+                            "record size overflow: ksz={ksz}, vsz={vsz}"
+                        )),
+                    })
+                })?;
+
+            if val_end > data_buffer.len() {
+                return Err(DbError::DataCorrupted(DataCorruptedErr {
+                    offset: offset + pos as u64,
+                    file_path: sstable.file_path.clone(),
+                    reason: CorruptionType::LengthMismatch {
+                        expected: val_end,
+                        found: data_buffer.len(),
+                    },
+                }));
+            }
+
+            let val_start = key_start + ksz; // if val_end is safe then this is safe(no overflow)
+            let curr_key = &data_buffer[key_start..val_start];
+            let value: &[u8] = &data_buffer[val_start..val_end];
+
+            match curr_key.cmp(key) {
+                Ordering::Less => {
+                    pos = val_end;
+                    continue;
+                }
+                Ordering::Equal => {
+                    if *deleted == 1 {
+                        return Ok(None);
+                    }
+                    return Ok(Some(value.to_vec()));
+                }
+                Ordering::Greater => break,
+            }
+        }
         Ok(None)
     }
+    fn search_for_kv_in_sstables(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        unimplemented!()
+    }
 
-    fn get(&mut self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let val = self.memtable.get(key);
         if let Some(c) = val {
             Ok(Some(c.to_vec()))
@@ -539,6 +565,9 @@ impl KVEngine {
         }
     }
 
+    fn sync_wal(&mut self) -> io::Result<()> {
+        unimplemented!()
+    }
     fn sync(&mut self) -> io::Result<()> {
         // forces any writes to sync to disk
         if let Some(writer) = &mut self.curr_file_buffer {
