@@ -1,24 +1,21 @@
 use crc::{CRC_32_ISO_HDLC, Crc};
 
+use core::num;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
-use std::mem;
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+
+use std::path::{Path, PathBuf};
+use std::thread::spawn;
 
 use crate::errors::{CorruptionType, DataCorruptedErr, DbError, Result};
-use crate::helpers::{
-    NUM_HASHES, compute_crc, compute_crc_data_block, get_hashed_key_positions, new_timestamp,
-};
+use crate::helpers::{NUM_HASHES, compute_crc_data_block, get_hashed_key_positions, new_timestamp};
 use std::cmp::{Ordering, max};
 
 const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024; // SUBJECT TO CHANGE
 const MEMTABLE_THRESHOLD: u64 = 4 * 1024 * 1024; // SUBJECT TO CHANGE
 const DATA_BLOCK: u16 = 8 * 1024; // Data block in SSTable
+const MAX_BLOCK_SIZE: u64 = 1024 * 1024;
 
 // WAL config for flush
 
@@ -32,6 +29,38 @@ enum SyncConfig {
 struct BloomFilter {
     bits: Vec<u64>,
     num_bits: u64,
+}
+
+impl BloomFilter {
+    fn new(num_bits: usize) -> Self {
+        let words_for_bits = num_bits.div_ceil(64);
+        Self {
+            bits: vec![0u64; words_for_bits],
+            num_bits: num_bits as u64,
+        }
+    }
+
+    fn set_bits(&mut self, positons: [usize; NUM_HASHES]) {
+        for position in positons {
+            let word_idx = position / 64;
+            let bit_idx = position % 64;
+
+            self.bits[word_idx] |= 1u64 << bit_idx; // shift the bit to the left by bit_idx positions and thats our mask. mask OR curr_u64 = done
+        }
+    }
+
+    fn check_bits(&self, positons: [usize; NUM_HASHES]) -> bool {
+        for position in positons {
+            let word_idx = position / 64;
+            let bit_idx = position % 64;
+
+            if ((self.bits[word_idx] >> bit_idx) & 1u64) == 0 {
+                return false;
+            }
+        }
+
+        true
+    }
 }
 
 struct FileId(u64);
@@ -59,19 +88,37 @@ impl WAL {
 
 struct SsTableDataBlock {
     bytes: Vec<u8>, //[ tstamp(8) | ksz(8) | value_sz(8) | key | value ] ... crc(4) (crc for the entire datablock);
-    size: u16,
+    size: usize,
     starting_key: Vec<u8>,
 }
 
 impl SsTableDataBlock {
-    fn new() {
-        unimplemented!();
+    fn new(s_key: &[u8]) -> Self {
+        // creates SsTableDataBlock
+        Self {
+            bytes: Vec::new(),
+            size: 0,
+            starting_key: s_key.to_vec(),
+        }
     }
-    fn append_to_block(&self) {
-        unimplemented!();
+    fn append_to_block(&mut self, entry: &[u8]) -> Option<&[u8]> {
+        if self.size < DATA_BLOCK as usize {
+            self.bytes.extend_from_slice(entry);
+            self.size += entry.len();
+        }
+
+        if self.size > DATA_BLOCK as usize {
+            let crc = compute_crc_data_block(&self.bytes);
+            self.bytes.extend_from_slice(&crc.to_le_bytes());
+            Some(&self.bytes)
+            // if we return the bytes, that means the block is done, push it to disk and create new block.
+            // this way its up to the caller to then call SsTableDataBlock::new on a mutable variable and then add the same
+        } else {
+            None
+        }
     }
 }
-
+// put the cold data into a SStable cold data vector(sparse index, etc)
 struct SSTable {
     id: u64,
     file: File,
@@ -124,6 +171,7 @@ impl SSTable {
 struct AVL {
     root: Option<Box<Node>>,
     threshold: u64,
+    size: u64,
 }
 #[derive(PartialEq, Clone, Debug)]
 struct AvlEntry {
@@ -144,6 +192,7 @@ impl AVL {
         Self {
             root: None,
             threshold,
+            size: 0,
         }
     }
 
@@ -195,6 +244,22 @@ impl AVL {
         } else {
             Some(Box::new(n))
         }
+    }
+
+    fn put(&mut self, key: &[u8], value: &[u8]) {
+        let n = Node {
+            key: key.to_vec(),
+            value: AvlEntry {
+                value: value.to_vec(),
+                deleted: false,
+            },
+            height: 0,
+            left: None,
+            right: None,
+        };
+        let root = self.root.take();
+        self.root = self.insert(root, n);
+        self.size += 1;
     }
 
     fn balance(mut node: Box<Node>) -> Box<Node> {
@@ -342,12 +407,34 @@ impl AVL {
             curr
         }
     }
+
     fn serialize_sstable_metadata() {
         unimplemented!();
+        // serialize the footer, sparse_index
     }
 
     fn build_bloom_filter_on_flush() {
         unimplemented!();
+        // its built after we attach all the data
+    }
+
+    fn in_order_iter(&self, n: &Option<Box<Node>>) {
+        if let Some(x) = n {
+            self.in_order_iter(&x.left);
+            println!("value of node is {:?}", x.value.value);
+            self.in_order_iter(&x.right);
+        }
+    }
+    fn sync_avl(&self, ss_path: &PathBuf) {
+        // build the bloom filter array(all zeroes)
+        // iterate through the avl from min to max key
+        // first key is min key, last key is max key for metadata
+        // for each key, hash it and flip the returned positions to 1 in the bloom filter array
+        // when each SsTableDataBlock ends(holds multiple kv pairs), we add it to a vector of key | offset | datablock block length ( before CRC )
+        // when we are done adding all SSTableDataBlocks, we add the sparse_footer, bloom_filter, min_key, max_key, metadata in that order
+        // the metadata tells us where the sparse footer begins, where the bloom_filter begins etc.
+        let bloom_filter = BloomFilter::new(self.size as usize * 10);
+        // in order iteration of avl tree
     }
 }
 struct KVEngine {
@@ -454,10 +541,21 @@ impl KVEngine {
     }
 
     //[ tstamp(8) | ksz(8) | value_sz(8) | key | value  tstamp(8) | ksz(8) | value_sz(8) | key | value ... crc(4)]
-    fn search_kv_in_sstable(&mut self, sstable: &SSTable, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    fn search_kv_in_sstable(sstable: &SSTable, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let Some((offset, data_len)) = sstable.binary_search_sparse_index(key) else {
             return Ok(None);
         };
+
+        if data_len > MAX_BLOCK_SIZE {
+            return Err(DbError::DataCorrupted(DataCorruptedErr {
+                offset,
+                file_path: sstable.file_path.clone(),
+                reason: CorruptionType::BufferExceedsMaxLength {
+                    size: data_len,
+                    max_size: MAX_BLOCK_SIZE,
+                },
+            }));
+        }
         let mut data_buffer = vec![0u8; data_len as usize];
         let mut crc = [0u8; 4];
 
@@ -550,7 +648,19 @@ impl KVEngine {
         Ok(None)
     }
     fn search_for_kv_in_sstables(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        unimplemented!()
+        if let Some(sstables) = &self.sstables {
+            for element in sstables.iter() {
+                match Self::should_search_sstable_file(key, element) {
+                    true => {
+                        if let Some(sstable) = Self::search_kv_in_sstable(element, key)? {
+                            return Ok(Some(sstable));
+                        }
+                    }
+                    false => continue,
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -565,7 +675,28 @@ impl KVEngine {
         }
     }
 
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        // put into wal, check if avl can hold, put into memtable unless memtable full -> new memtable -> old sync
+        match ((key.len() + value.len()) as u64) < self.memtable.size {
+            true => {
+                self.memtable.put(key, value);
+            }
+            false => {
+                self.rotate_active_file()?; // as of right now, we have to wait for this function to be done before we do a mem.put
+                // later we will start a new memtable and have the old one flush in the background
+                self.memtable.put(key, value);
+            }
+        }
+
+        Ok(())
+    }
+
     fn sync_wal(&mut self) -> io::Result<()> {
+        unimplemented!()
+        // reads wal and writes to disk
+        // gets called if a crash occurs, if no crash, judt delete wal safely
+    }
+    fn sync_memtable(memtable: AVL) {
         unimplemented!()
     }
     fn sync(&mut self) -> io::Result<()> {
@@ -579,6 +710,24 @@ impl KVEngine {
     }
 
     // rotate active file should change to rotate_memtable_and_wal()
+    fn rotate_memtable_and_wal(&mut self) -> Result<()> {
+        // start a new memtable
+        let old_memtable = std::mem::replace(&mut self.memtable, AVL::new(MEMTABLE_THRESHOLD));
+        let old_wal = std::mem::replace(
+            &mut self.wal,
+            WAL::new(MEMTABLE_THRESHOLD, self.sync_config)?,
+        );
+        // hand memtable to another thread to be flushed, and keep it readable until flush is over(put in Arc)
+        let handle = spawn(move || {
+            // walks through old_memtable and write it to a new sstable.
+            // when done, we
+        });
+
+        // only delete the old wal when everything is flushed to disk.
+
+        Ok(())
+    }
+
     fn rotate_active_file(&mut self) -> io::Result<()> {
         if let Some(writer) = &mut self.curr_file_buffer {
             writer.flush()?;

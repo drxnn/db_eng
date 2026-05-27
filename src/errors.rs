@@ -18,6 +18,7 @@ pub enum CorruptionType {
     CrcMismatch { expected: u32, found: u32 },
     Other(String),
     LengthMismatch { expected: usize, found: usize },
+    BufferExceedsMaxLength { size: u64, max_size: u64 },
 }
 
 #[derive(Debug)]
@@ -30,13 +31,16 @@ impl fmt::Display for CorruptionType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::CrcMismatch { expected, found } => {
-                write!(f, "expected crc: {}. Found crc: {}", expected, found)
+                write!(f, "Expected crc: {}. Found crc: {}", expected, found)
             }
             Self::Other(str) => {
                 write!(f, "{}", str)
             }
             Self::LengthMismatch { expected, found } => {
-                write!(f, "expected length: {}. Found length: {}", expected, found)
+                write!(f, "Expected length: {}. Found length: {}", expected, found)
+            }
+            Self::BufferExceedsMaxLength { size, max_size } => {
+                write!(f, "Buffer Size: {}. Max size allowed: {}", size, max_size)
             }
         }
     }
