@@ -24,6 +24,7 @@ pub enum CorruptionType {
 #[derive(Debug)]
 pub enum DbError {
     DataCorrupted(DataCorruptedErr),
+    MissingKey(String),
     Io(std::io::Error),
 }
 
@@ -63,6 +64,7 @@ impl fmt::Display for DbError {
         match self {
             Self::DataCorrupted(err) => write!(f, "data corrupted: {}", err),
             Self::Io(err) => write!(f, "I/O error: {}", err),
+            Self::MissingKey(err) => write!(f, "Missing key in memtable: {}", err),
         }
     }
 }

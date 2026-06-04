@@ -31,6 +31,32 @@ struct BloomFilter {
     num_bits: u64,
 }
 
+struct SparseIndex {
+    index_entries: Vec<Vec<u8>>,
+    size: u64,
+}
+
+impl SparseIndex {
+    fn new() -> Self {
+        Self {
+            index_entries: Vec::new(),
+            size: 0,
+        }
+    }
+    fn add_entry(&mut self, ss_data_block: SsTableDataBlock, offset: u64) {
+        // TODO: Figure out a more cache friendly format here? instead of Vec<Vec<u8>>
+        let full_block = ss_data_block.full_data_block();
+        let first_keysz = (full_block.starting_key.len() as u64).to_le_bytes();
+        let data_block_sz = (full_block.bytes.len() as u64).to_le_bytes();
+        let mut sparse_entry: Vec<u8> = Vec::new();
+        // sparse index: sizeof(k), k, offset, datablock_size);
+        sparse_entry.extend_from_slice(&first_keysz);
+        sparse_entry.extend_from_slice(&full_block.starting_key);
+        sparse_entry.extend_from_slice(&offset.to_le_bytes());
+        sparse_entry.extend_from_slice(&data_block_sz);
+    }
+}
+
 impl BloomFilter {
     fn new(num_bits: usize) -> Self {
         let words_for_bits = num_bits.div_ceil(64);
@@ -101,21 +127,19 @@ impl SsTableDataBlock {
             starting_key: s_key.to_vec(),
         }
     }
-    fn append_to_block(&mut self, entry: &[u8]) -> Option<&[u8]> {
-        if self.size < DATA_BLOCK as usize {
-            self.bytes.extend_from_slice(entry);
-            self.size += entry.len();
-        }
+    fn append_to_block(&mut self, entry: &[u8]) {
+        self.bytes.extend_from_slice(entry);
+        self.size += entry.len();
+    }
 
-        if self.size > DATA_BLOCK as usize {
-            let crc = compute_crc_data_block(&self.bytes);
-            self.bytes.extend_from_slice(&crc.to_le_bytes());
-            Some(&self.bytes)
-            // if we return the bytes, that means the block is done, push it to disk and create new block.
-            // this way its up to the caller to then call SsTableDataBlock::new on a mutable variable and then add the same
-        } else {
-            None
-        }
+    fn is_finished(&self) -> bool {
+        self.size > DATA_BLOCK as usize
+    }
+
+    fn full_data_block(mut self) -> Self {
+        let crc = compute_crc_data_block(&self.bytes);
+        self.bytes.extend_from_slice(&crc.to_le_bytes());
+        self
     }
 }
 // put the cold data into a SStable cold data vector(sparse index, etc)
@@ -126,7 +150,8 @@ struct SSTable {
     file_size: u64,
     min_key: Vec<u8>,
     max_key: Vec<u8>,
-    sparse_index: Vec<(Vec<u8>, u64, u64)>, // key | offset | datablock block length ( before CRC, which means you need to read the next 4 bytes and compute the crc)
+    // ! fix sparse index to be keysz | offset | db length
+    sparse_index: Vec<(Vec<u8>, u64, u64)>, // keysz | offset | datablock block length ( before CRC, which means you need to read the next 4 bytes and compute the crc)
     bloom_filter: BloomFilter,
     corrupted: bool,
 }
@@ -172,6 +197,7 @@ struct AVL {
     root: Option<Box<Node>>,
     threshold: u64,
     size: u64,
+    buf_file: Option<BufWriter<File>>, // to write to sstable on flush
 }
 #[derive(PartialEq, Clone, Debug)]
 struct AvlEntry {
@@ -187,12 +213,24 @@ struct Node {
     right: Option<Box<Node>>,
 }
 
+impl Node {
+    fn serialize_kv(&self) -> Vec<u8> {
+        // return [ tstamp(8) | ksz(8) | value_sz(8) | key | value ]
+        let tstamp = new_timestamp().to_le_bytes();
+        let ksz = self.key.len().to_le_bytes();
+        let vsz = self.value.value.len().to_le_bytes();
+
+        [&tstamp, &ksz, &vsz, self.key.as_slice(), &self.value.value].concat()
+    }
+}
+
 impl AVL {
     fn new(threshold: u64) -> Self {
         Self {
             root: None,
             threshold,
             size: 0,
+            buf_file: None,
         }
     }
 
@@ -408,33 +446,155 @@ impl AVL {
         }
     }
 
-    fn serialize_sstable_metadata() {
-        unimplemented!();
-        // serialize the footer, sparse_index
-    }
-
-    fn build_bloom_filter_on_flush() {
-        unimplemented!();
-        // its built after we attach all the data
-    }
-
-    fn in_order_iter(&self, n: &Option<Box<Node>>) {
-        if let Some(x) = n {
-            self.in_order_iter(&x.left);
-            println!("value of node is {:?}", x.value.value);
-            self.in_order_iter(&x.right);
+    fn get_min_node(node: &Option<Box<Node>>) -> Option<&Vec<u8>> {
+        let mut curr = node.as_ref()?;
+        while let Some(n) = curr.left.as_ref() {
+            curr = n
         }
+
+        Some(&curr.key)
     }
-    fn sync_avl(&self, ss_path: &PathBuf) {
-        // build the bloom filter array(all zeroes)
-        // iterate through the avl from min to max key
-        // first key is min key, last key is max key for metadata
-        // for each key, hash it and flip the returned positions to 1 in the bloom filter array
-        // when each SsTableDataBlock ends(holds multiple kv pairs), we add it to a vector of key | offset | datablock block length ( before CRC )
-        // when we are done adding all SSTableDataBlocks, we add the sparse_footer, bloom_filter, min_key, max_key, metadata in that order
-        // the metadata tells us where the sparse footer begins, where the bloom_filter begins etc.
-        let bloom_filter = BloomFilter::new(self.size as usize * 10);
-        // in order iteration of avl tree
+    fn get_max_node(node: &Option<Box<Node>>) -> Option<&Vec<u8>> {
+        let mut curr = node.as_ref()?;
+
+        while let Some(n) = curr.right.as_ref() {
+            curr = n
+        }
+
+        Some(&curr.key)
+    }
+
+    fn serialize_sstable_footer(
+        offset: &mut u64,
+        min_key: &[u8],
+        max_key: &[u8],
+        sizeof_si: u64,
+        sizeof_bf: u64,
+    ) -> Vec<u8> {
+        // returns the footer
+        // | min key | max key | sizeof(sparse_index) | sparse_index_offset| sizeof(bloom_filter) | bloom filter_offset | sizeof(minkey) | minkey offset | sizeof(maxkey) | maxkey offset |
+        let mut footer: Vec<u8> = Vec::new();
+        // offset is start_of_sparse_index
+
+        // TODO: I dont need to save all the offsets necessarily in the footer. They can mostly be derived from other offsets = si_offset + size
+        let min_key_offset = *offset + sizeof_bf + sizeof_si;
+        let max_key_offset = min_key_offset + max_key.len() as u64;
+        footer.extend_from_slice(min_key);
+        footer.extend_from_slice(max_key);
+        footer.extend_from_slice(&sizeof_si.to_le_bytes());
+        footer.extend_from_slice(&offset.to_le_bytes());
+        *offset += sizeof_si;
+        footer.extend_from_slice(&sizeof_bf.to_le_bytes());
+        footer.extend_from_slice(&offset.to_le_bytes()); //bf offset
+        footer.extend_from_slice(&(min_key.len() as u64).to_le_bytes());
+
+        footer.extend_from_slice(&min_key_offset.to_le_bytes());
+        footer.extend_from_slice(&(max_key.len() as u64).to_le_bytes());
+        footer.extend_from_slice(&max_key_offset.to_le_bytes());
+
+        // serialize the footer, sparse_index
+        footer
+    }
+
+    fn in_order_iter_bf_build(
+        &mut self,
+        n: &Option<Box<Node>>,
+        bf: &mut BloomFilter,
+        data_block: &mut Option<SsTableDataBlock>,
+        sparse_index: &mut SparseIndex,
+        offset: &mut u64,
+    ) -> Result<()> {
+        if let Some(x) = n {
+            self.in_order_iter_bf_build(&x.left, bf, data_block, sparse_index, offset)?;
+            if let Some(ss_data_block) = data_block {
+                match ss_data_block.is_finished() {
+                    true => {
+                        let owned_ss_data_block =
+                            data_block.take().expect("Expected a SsTableDataBlock");
+                        if let Some(writer) = self.buf_file.as_mut() {
+                            writer.write_all(&owned_ss_data_block.bytes)?;
+                        }
+                        *offset += owned_ss_data_block.bytes.len() as u64;
+                        sparse_index.add_entry(owned_ss_data_block, *offset);
+
+                        let mut new_ss_db = SsTableDataBlock::new(&x.key);
+                        new_ss_db.append_to_block(&x.serialize_kv());
+                        *data_block = Some(new_ss_db);
+                    }
+                    false => {
+                        ss_data_block.append_to_block(&x.serialize_kv());
+                    }
+                }
+            } else {
+                let mut new_ss_db = SsTableDataBlock::new(&x.key);
+                new_ss_db.append_to_block(&x.serialize_kv());
+                *data_block = Some(new_ss_db);
+            }
+            let positions = get_hashed_key_positions(&x.key, bf.num_bits as usize);
+            bf.set_bits(positions);
+            self.in_order_iter_bf_build(&x.right, bf, data_block, sparse_index, offset)?;
+        }
+        Ok(())
+    }
+    fn sync_avl(&mut self, ss_path: &Path) -> Result<()> {
+        let f = File::create(ss_path)?;
+        self.buf_file = Some(BufWriter::new(f));
+        let mut data_block: Option<SsTableDataBlock> = None;
+        // sizeof(key) | key | offset | datablock block length ( before CRC )
+        let mut sparse_index = SparseIndex::new();
+        let mut bloom_filter = BloomFilter::new(self.size as usize * 10);
+
+        let root = self.root.take();
+        let min_k = Self::get_min_node(&root).ok_or(DbError::MissingKey(
+            "Min key missing in memtable during flushing operation".to_string(),
+        ))?;
+        let max_k = Self::get_max_node(&root).ok_or(DbError::MissingKey(
+            "Max key missing in memtable during flushing operation".to_string(),
+        ))?;
+
+        let mut file_offset: u64 = 0;
+        self.in_order_iter_bf_build(
+            &root,
+            &mut bloom_filter,
+            &mut data_block,
+            &mut sparse_index,
+            &mut file_offset,
+        )?;
+
+        if let Some(last_db) = data_block {
+            let len = last_db.bytes.len() as u64;
+            if let Some(writer) = self.buf_file.as_mut() {
+                writer.write_all(&last_db.bytes)?;
+            }
+
+            sparse_index.add_entry(last_db, file_offset);
+
+            file_offset += len; // length here is the start of sparse_index
+
+            if let Some(writer) = self.buf_file.as_mut() {
+                for entry in &sparse_index.index_entries {
+                    writer.write_all(entry)?;
+                }
+                for word in &bloom_filter.bits {
+                    writer.write_all(&word.to_le_bytes())?;
+                }
+                writer.flush()?;
+                let f = writer.get_ref();
+                f.sync_all()?;
+            }
+        }
+        // footer is :  | min key | max key | sizeof(sparse_index) | sparse_index_offset| sizeof(bloom_filter) | bloom filter_offset | sizeof(minkey) | minkey offset | sizeof(maxkey) | maxkey offset |
+
+        // fix HERE
+        let footer = Self::serialize_sstable_footer(
+            &mut file_offset,
+            min_k,
+            max_k,
+            sparse_index.size,
+            bloom_filter.num_bits,
+        );
+        self.root = root; // returning root here because min_k and max_k above are borrows of root
+        Ok(())
     }
 }
 struct KVEngine {
@@ -765,13 +925,14 @@ impl KVEngine {
 }
 
 /*Notes:
-Footer: [ sparse_index(sizeof sio) | bloom_filter(sizeof bfo)|sparse_index_offset(8) | bloom_filter_offset(8) | min_key(8) | max_key(8)]
+ // footer is :  | min key | max key | sizeof(sparse_index) | sparse_index_offset| sizeof(bloom_filter) | bloom filter_offset | sizeof(minkey) | minkey offset | sizeof(maxkey) | maxkey offset | 64 bytes(not including min and max key)
 DataBlocks:  [ tstamp(8) | ksz(8) | value_sz(8) | key | value  tstamp(8) | ksz(8) | value_sz(8) | key | value ... crc(4)]
 SSTable: Datablock1 | DataBlock2 ... Datablock N | Footer
 Bloom filter: k-hash bit array per SSTable to skip files on negative lookups. Use 10 bits per key. Built during flush of AVL.
 */
 // SparseIndex => [ firskey:[offset, datablock_length] ]
 
+// When you read a data block in the sparse index, remember to account for the 4 crc bytes yourself, they are not accounted forin the length
 /*
 TODOS:
 Build SSTables on open to have the metadata in memory.
