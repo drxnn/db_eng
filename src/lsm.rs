@@ -477,6 +477,7 @@ impl AVL {
         // offset is start_of_sparse_index
 
         // TODO: I dont need to save all the offsets necessarily in the footer. They can mostly be derived from other offsets = si_offset + size
+        // Come up with a more space efficient footer. Works for now
         let min_key_offset = *offset + sizeof_bf + sizeof_si;
         let max_key_offset = min_key_offset + max_key.len() as u64;
         footer.extend_from_slice(min_key);
@@ -514,8 +515,9 @@ impl AVL {
                         if let Some(writer) = self.buf_file.as_mut() {
                             writer.write_all(&owned_ss_data_block.bytes)?;
                         }
-                        *offset += owned_ss_data_block.bytes.len() as u64;
+                        let data_block_len = owned_ss_data_block.bytes.len() as u64;
                         sparse_index.add_entry(owned_ss_data_block, *offset);
+                        *offset += data_block_len;
 
                         let mut new_ss_db = SsTableDataBlock::new(&x.key);
                         new_ss_db.append_to_block(&x.serialize_kv());
@@ -536,7 +538,8 @@ impl AVL {
         }
         Ok(())
     }
-    fn sync_avl(&mut self, ss_path: &Path) -> Result<()> {
+    fn sync_avl(&mut self, ss_path: &Path) -> Result<File> {
+        // maybe dont pass ss_path and instead create it here, timestamp.sst
         let f = File::create(ss_path)?;
         self.buf_file = Some(BufWriter::new(f));
         let mut data_block: Option<SsTableDataBlock> = None;
@@ -545,12 +548,12 @@ impl AVL {
         let mut bloom_filter = BloomFilter::new(self.size as usize * 10);
 
         let root = self.root.take();
-        let min_k = Self::get_min_node(&root).ok_or(DbError::MissingKey(
-            "Min key missing in memtable during flushing operation".to_string(),
-        ))?;
-        let max_k = Self::get_max_node(&root).ok_or(DbError::MissingKey(
-            "Max key missing in memtable during flushing operation".to_string(),
-        ))?;
+        let min_k = Self::get_min_node(&root).ok_or_else(|| {
+            DbError::MissingKey("Min key missing in memtable during flushing operation".to_string())
+        })?;
+        let max_k = Self::get_max_node(&root).ok_or_else(|| {
+            DbError::MissingKey("Max key missing in memtable during flushing operation".to_string())
+        })?;
 
         let mut file_offset: u64 = 0;
         self.in_order_iter_bf_build(
@@ -570,6 +573,13 @@ impl AVL {
             sparse_index.add_entry(last_db, file_offset);
 
             file_offset += len; // length here is the start of sparse_index
+            let footer = Self::serialize_sstable_footer(
+                &mut file_offset,
+                min_k,
+                max_k,
+                sparse_index.size,
+                bloom_filter.num_bits,
+            );
 
             if let Some(writer) = self.buf_file.as_mut() {
                 for entry in &sparse_index.index_entries {
@@ -578,23 +588,34 @@ impl AVL {
                 for word in &bloom_filter.bits {
                     writer.write_all(&word.to_le_bytes())?;
                 }
+
+                writer.write_all(&footer)?;
                 writer.flush()?;
                 let f = writer.get_ref();
                 f.sync_all()?;
             }
         }
-        // footer is :  | min key | max key | sizeof(sparse_index) | sparse_index_offset| sizeof(bloom_filter) | bloom filter_offset | sizeof(minkey) | minkey offset | sizeof(maxkey) | maxkey offset |
 
-        // fix HERE
-        let footer = Self::serialize_sstable_footer(
-            &mut file_offset,
-            min_k,
-            max_k,
-            sparse_index.size,
-            bloom_filter.num_bits,
-        );
         self.root = root; // returning root here because min_k and max_k above are borrows of root
-        Ok(())
+
+        let f = self
+            .buf_file
+            .take()
+            .ok_or_else(|| {
+                DbError::FileError(
+                    "Failed to take File out of BufWriter".to_string(),
+                    ss_path.to_path_buf(),
+                )
+            })?
+            .into_inner()
+            .map_err(|e| {
+                DbError::FileError(
+                    format!("Failed to extract File from BufWriter: {}", e.error()),
+                    ss_path.to_path_buf(),
+                )
+            })?;
+
+        Ok(f)
     }
 }
 struct KVEngine {
@@ -610,8 +631,9 @@ struct KVEngine {
 }
 
 impl KVEngine {
-    fn create_new_data_file(dir: &Path, tstamp: u64) -> io::Result<(File, PathBuf)> {
-        let data_file_path = dir.join(format!("{}.data", tstamp));
+    fn create_new_data_file(dir: &Path) -> io::Result<(File, PathBuf)> {
+        let tstamp = new_timestamp();
+        let data_file_path = dir.join(format!("{}.sst", tstamp));
         let data_file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -672,7 +694,7 @@ impl KVEngine {
         if let Some(active_sstable) = sstables.pop() {
             let ss_metadata = active_sstable.file.metadata()?;
             if ss_metadata.len() >= MAX_FILE_SIZE {
-                self_instance.rotate_active_file()?;
+                self_instance.rotate_active_file()?; // TODO
             } else {
                 self_instance.curr_file_buffer =
                     Some(BufWriter::with_capacity(256000, active_sstable.file));
@@ -872,15 +894,22 @@ impl KVEngine {
     // rotate active file should change to rotate_memtable_and_wal()
     fn rotate_memtable_and_wal(&mut self) -> Result<()> {
         // start a new memtable
-        let old_memtable = std::mem::replace(&mut self.memtable, AVL::new(MEMTABLE_THRESHOLD));
+        let mut old_memtable = std::mem::replace(&mut self.memtable, AVL::new(MEMTABLE_THRESHOLD));
         let old_wal = std::mem::replace(
             &mut self.wal,
             WAL::new(MEMTABLE_THRESHOLD, self.sync_config)?,
         );
+        let data_dir = self.data_directory.clone();
+
         // hand memtable to another thread to be flushed, and keep it readable until flush is over(put in Arc)
-        let handle = spawn(move || {
+        let handle = spawn(move || -> Result<File> {
             // walks through old_memtable and write it to a new sstable.
-            // when done, we
+
+            let new_sst_file_path = KVEngine::create_new_data_file(&data_dir)?.1;
+
+            let f = old_memtable.sync_avl(&new_sst_file_path)?;
+
+            Ok(f)
         });
 
         // only delete the old wal when everything is flushed to disk.
@@ -898,8 +927,8 @@ impl KVEngine {
             let sstable = SSTable::load(&old_path);
             files.push(sstable);
         }
-        let tstamp = new_timestamp();
-        let new_data_file_tuple = KVEngine::create_new_data_file(&self.data_directory, tstamp)?;
+
+        let new_data_file_tuple = KVEngine::create_new_data_file(&self.data_directory)?;
 
         self.curr_file_buffer = Some(BufWriter::with_capacity(256000, new_data_file_tuple.0));
         self.curr_file_path = Some(new_data_file_tuple.1);

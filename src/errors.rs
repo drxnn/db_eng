@@ -26,6 +26,8 @@ pub enum DbError {
     DataCorrupted(DataCorruptedErr),
     MissingKey(String),
     Io(std::io::Error),
+    FileError(String, PathBuf),
+    MemTableSyncError(String),
 }
 
 impl fmt::Display for CorruptionType {
@@ -65,6 +67,12 @@ impl fmt::Display for DbError {
             Self::DataCorrupted(err) => write!(f, "data corrupted: {}", err),
             Self::Io(err) => write!(f, "I/O error: {}", err),
             Self::MissingKey(err) => write!(f, "Missing key in memtable: {}", err),
+            Self::FileError(err, path) => {
+                write!(f, "Error in file:{}. Err: {}", path.display(), err)
+            }
+            Self::MemTableSyncError(err) => {
+                write!(f, "Error while syncing memtable: {}", err)
+            }
         }
     }
 }
