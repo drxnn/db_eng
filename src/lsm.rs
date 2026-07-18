@@ -6,6 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread::spawn;
 
 use crate::errors::{CorruptionType, DataCorruptedErr, DbError, Result};
@@ -110,6 +111,9 @@ impl WAL {
             sync_c,
         })
     }
+    fn destruct(&self) {
+        unimplemented!()
+    }
 }
 
 struct SsTableDataBlock {
@@ -142,7 +146,7 @@ impl SsTableDataBlock {
         self
     }
 }
-// put the cold data into a SStable cold data vector(sparse index, etc)
+// put the cold data into a SStable cold data vector(sparse index, etc)*
 struct SSTable {
     id: u64,
     file: File,
@@ -497,8 +501,10 @@ impl AVL {
         footer
     }
 
+    // need a better name here, bf is built but we also write the the data blocks into the sstable and we are buiding the sparse index. so we are doing multiple things.
     fn in_order_iter_bf_build(
-        &mut self,
+        &self,
+        writer: &mut BufWriter<File>,
         n: &Option<Box<Node>>,
         bf: &mut BloomFilter,
         data_block: &mut Option<SsTableDataBlock>,
@@ -506,15 +512,15 @@ impl AVL {
         offset: &mut u64,
     ) -> Result<()> {
         if let Some(x) = n {
-            self.in_order_iter_bf_build(&x.left, bf, data_block, sparse_index, offset)?;
+            self.in_order_iter_bf_build(writer, &x.left, bf, data_block, sparse_index, offset)?;
             if let Some(ss_data_block) = data_block {
                 match ss_data_block.is_finished() {
                     true => {
                         let owned_ss_data_block =
                             data_block.take().expect("Expected a SsTableDataBlock");
-                        if let Some(writer) = self.buf_file.as_mut() {
-                            writer.write_all(&owned_ss_data_block.bytes)?;
-                        }
+
+                        writer.write_all(&owned_ss_data_block.bytes)?;
+
                         let data_block_len = owned_ss_data_block.bytes.len() as u64;
                         sparse_index.add_entry(owned_ss_data_block, *offset);
                         *offset += data_block_len;
@@ -534,30 +540,31 @@ impl AVL {
             }
             let positions = get_hashed_key_positions(&x.key, bf.num_bits as usize);
             bf.set_bits(positions);
-            self.in_order_iter_bf_build(&x.right, bf, data_block, sparse_index, offset)?;
+            self.in_order_iter_bf_build(writer, &x.right, bf, data_block, sparse_index, offset)?;
         }
         Ok(())
     }
-    fn sync_avl(&mut self, ss_path: &Path) -> Result<File> {
-        // maybe dont pass ss_path and instead create it here, timestamp.sst
-        let f = File::create(ss_path)?;
-        self.buf_file = Some(BufWriter::new(f));
+
+    // What if engine crashes mid sync_avl execution?
+    fn sync_avl(&self, ss_path: &Path) -> Result<File> {
+        let mut writer_1 = BufWriter::new(File::create(ss_path)?);
         let mut data_block: Option<SsTableDataBlock> = None;
         // sizeof(key) | key | offset | datablock block length ( before CRC )
         let mut sparse_index = SparseIndex::new();
         let mut bloom_filter = BloomFilter::new(self.size as usize * 10);
 
-        let root = self.root.take();
-        let min_k = Self::get_min_node(&root).ok_or_else(|| {
+        // let root = self.root.take();
+        let min_k = Self::get_min_node(&self.root).ok_or_else(|| {
             DbError::MissingKey("Min key missing in memtable during flushing operation".to_string())
         })?;
-        let max_k = Self::get_max_node(&root).ok_or_else(|| {
+        let max_k = Self::get_max_node(&self.root).ok_or_else(|| {
             DbError::MissingKey("Max key missing in memtable during flushing operation".to_string())
         })?;
 
         let mut file_offset: u64 = 0;
         self.in_order_iter_bf_build(
-            &root,
+            &mut writer_1,
+            &self.root,
             &mut bloom_filter,
             &mut data_block,
             &mut sparse_index,
@@ -566,54 +573,36 @@ impl AVL {
 
         if let Some(last_db) = data_block {
             let len = last_db.bytes.len() as u64;
-            if let Some(writer) = self.buf_file.as_mut() {
-                writer.write_all(&last_db.bytes)?;
-            }
+
+            writer_1.write_all(&last_db.bytes)?;
 
             sparse_index.add_entry(last_db, file_offset);
 
-            file_offset += len; // length here is the start of sparse_index
-            let footer = Self::serialize_sstable_footer(
-                &mut file_offset,
-                min_k,
-                max_k,
-                sparse_index.size,
-                bloom_filter.num_bits,
-            );
-
-            if let Some(writer) = self.buf_file.as_mut() {
-                for entry in &sparse_index.index_entries {
-                    writer.write_all(entry)?;
-                }
-                for word in &bloom_filter.bits {
-                    writer.write_all(&word.to_le_bytes())?;
-                }
-
-                writer.write_all(&footer)?;
-                writer.flush()?;
-                let f = writer.get_ref();
-                f.sync_all()?;
-            }
+            file_offset += len; // length here is the start of sparse_index // 
         }
+        let footer = Self::serialize_sstable_footer(
+            &mut file_offset,
+            min_k,
+            max_k,
+            sparse_index.size,
+            bloom_filter.num_bits,
+        );
 
-        self.root = root; // returning root here because min_k and max_k above are borrows of root
+        for entry in &sparse_index.index_entries {
+            writer_1.write_all(entry)?;
+        }
+        for word in &bloom_filter.bits {
+            writer_1.write_all(&word.to_le_bytes())?;
+        }
+        writer_1.write_all(&footer)?;
 
-        let f = self
-            .buf_file
-            .take()
-            .ok_or_else(|| {
-                DbError::FileError(
-                    "Failed to take File out of BufWriter".to_string(),
-                    ss_path.to_path_buf(),
-                )
-            })?
-            .into_inner()
-            .map_err(|e| {
-                DbError::FileError(
-                    format!("Failed to extract File from BufWriter: {}", e.error()),
-                    ss_path.to_path_buf(),
-                )
-            })?;
+        let f = writer_1.into_inner().map_err(|e| {
+            DbError::FileError(
+                format!("Failed to extract File from BufWriter: {}", e.error()),
+                ss_path.to_path_buf(),
+            )
+        })?;
+        f.sync_all()?;
 
         Ok(f)
     }
@@ -627,6 +616,7 @@ struct KVEngine {
     sync_config: SyncConfig,
     wal: WAL,
     memtable: AVL,
+    flushing_memtable: Option<Arc<AVL>>,
     corrupted_files: HashSet<FileId>,
 }
 
@@ -682,6 +672,7 @@ impl KVEngine {
             curr_file_offset: 0,
             sync_config,
             memtable,
+            flushing_memtable: None,
             wal,
             corrupted_files: HashSet::new(),
         };
@@ -858,14 +849,15 @@ impl KVEngine {
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        // put into wal, check if avl can hold, put into memtable unless memtable full -> new memtable -> old sync
-        match ((key.len() + value.len()) as u64) < self.memtable.size {
+        match ((key.len() as u64 + value.len() as u64 + self.memtable.size) as u64)
+            < self.memtable.threshold
+        {
             true => {
                 self.memtable.put(key, value);
             }
             false => {
-                self.rotate_active_file()?; // as of right now, we have to wait for this function to be done before we do a mem.put
-                // later we will start a new memtable and have the old one flush in the background
+                self.rotate_memtable_and_wal()?;
+
                 self.memtable.put(key, value);
             }
         }
@@ -891,28 +883,34 @@ impl KVEngine {
         Ok(())
     }
 
-    // rotate active file should change to rotate_memtable_and_wal()
     fn rotate_memtable_and_wal(&mut self) -> Result<()> {
-        // start a new memtable
-        let mut old_memtable = std::mem::replace(&mut self.memtable, AVL::new(MEMTABLE_THRESHOLD));
+        let frozen = Arc::new(std::mem::replace(
+            &mut self.memtable,
+            AVL::new(MEMTABLE_THRESHOLD),
+        ));
+        self.flushing_memtable = Some(Arc::clone(&frozen));
         let old_wal = std::mem::replace(
             &mut self.wal,
             WAL::new(MEMTABLE_THRESHOLD, self.sync_config)?,
         );
-        let data_dir = self.data_directory.clone();
-
-        // hand memtable to another thread to be flushed, and keep it readable until flush is over(put in Arc)
-        let handle = spawn(move || -> Result<File> {
-            // walks through old_memtable and write it to a new sstable.
-
-            let new_sst_file_path = KVEngine::create_new_data_file(&data_dir)?.1;
-
-            let f = old_memtable.sync_avl(&new_sst_file_path)?;
+        let ss_path = KVEngine::create_new_data_file(&self.data_directory)?.1;
+        // What to do: Have the flushing thread have the frozen memtable as an Arc<> and the main thread can have it as a Weak and everytime we do a get we can check if we can upgrade to it in order to get the value we need
+        // once flushing_thread is done with Arc<memtable>, the main thread won't be able to upgrade to it so we are good
+        /*
+               if let Some(memtable) = self.flushing_memtable.upgrade() {
+        // if something is here we do memtable.get
+        } drops here and thats it
+                */
+        spawn(move || -> Result<File> {
+            let f = frozen.sync_avl(&ss_path)?;
+            // let sstable = SSTable::load(&old_path);
+            // files.push(sstable);
+            old_wal.destruct();
 
             Ok(f)
         });
 
-        // only delete the old wal when everything is flushed to disk.
+        // only delete the old wal when everything is flushed to disk. So when the thread we spawned finishes, we are clear to delete the old_wal and also delete the frozen memtable
 
         Ok(())
     }
