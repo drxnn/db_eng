@@ -2,11 +2,13 @@ use crc::{CRC_32_ISO_HDLC, Crc};
 
 use core::num;
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, remove_file};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, RwLock};
+use std::sync::{Weak, mpsc};
 use std::thread::spawn;
 
 use crate::errors::{CorruptionType, DataCorruptedErr, DbError, Result};
@@ -96,22 +98,50 @@ struct WAL {
     wal_writer: Option<BufWriter<File>>,
     sync_c: SyncConfig,
     threshold: u64,
+    path: PathBuf,
 }
 
 impl WAL {
     fn new(threshold: u64, sync_c: SyncConfig) -> io::Result<WAL> {
+        let tstamp = new_timestamp();
+        let wal_path = PathBuf::from(format!("{}.wal", tstamp));
         let wal_file = OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
-            .open("walfile.wal")?;
+            .open(&wal_path)?;
         Ok(Self {
             wal_writer: Some(BufWriter::new(wal_file)),
             threshold,
             sync_c,
+            path: wal_path,
         })
     }
-    fn destruct(&self) {
+    fn destruct(mut self) -> Result<()> {
+        self.wal_writer = None;
+        remove_file(&self.path)?;
+        Ok(())
+    }
+
+    fn record_to_wal(&mut self, k: &[u8], v: &[u8], delete: bool) -> Result<()> {
+        let ksz = k.len().to_le_bytes();
+        let vsz = v.len().to_le_bytes();
+        let mut record = [&ksz, &vsz, k, v].concat();
+        let crc = compute_crc_data_block(&record);
+        record.extend_from_slice(&crc.to_le_bytes());
+
+        if let Some(writer) = self.wal_writer.as_mut() {
+            writer.write_all(&record)?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn sync_wal(&mut self, path: &PathBuf) -> Result<()> {
+        /*
+        //
+         */
         unimplemented!()
     }
 }
@@ -147,7 +177,7 @@ impl SsTableDataBlock {
     }
 }
 // put the cold data into a SStable cold data vector(sparse index, etc)*
-struct SSTable {
+pub struct SSTable {
     id: u64,
     file: File,
     file_path: PathBuf,
@@ -287,6 +317,9 @@ impl AVL {
             Some(Box::new(n))
         }
     }
+    /*
+
+    */
 
     fn put(&mut self, key: &[u8], value: &[u8]) {
         let n = Node {
@@ -545,15 +578,17 @@ impl AVL {
         Ok(())
     }
 
-    // What if engine crashes mid sync_avl execution?
-    fn sync_avl(&self, ss_path: &Path) -> Result<File> {
-        let mut writer_1 = BufWriter::new(File::create(ss_path)?);
+    // What if engine crashes mid sync_avl execution? // check if need to be called on start/restart
+    // PROBLEM: right now we are just adding any value to the sstables as is without regard of deletion tombstones
+    // SOLUTION: add a deletion flag as 1 byte in the data format and then check avlEntry.deleted to see if value is active or deleted
+    fn sync_avl(&self, ss_path_tmp: &Path, ss_path_final: &Path) -> Result<File> {
+        let mut writer_1 = BufWriter::new(File::create(ss_path_tmp)?);
         let mut data_block: Option<SsTableDataBlock> = None;
+
         // sizeof(key) | key | offset | datablock block length ( before CRC )
         let mut sparse_index = SparseIndex::new();
         let mut bloom_filter = BloomFilter::new(self.size as usize * 10);
 
-        // let root = self.root.take();
         let min_k = Self::get_min_node(&self.root).ok_or_else(|| {
             DbError::MissingKey("Min key missing in memtable during flushing operation".to_string())
         })?;
@@ -599,37 +634,93 @@ impl AVL {
         let f = writer_1.into_inner().map_err(|e| {
             DbError::FileError(
                 format!("Failed to extract File from BufWriter: {}", e.error()),
-                ss_path.to_path_buf(),
+                ss_path_tmp.to_path_buf(),
             )
         })?;
         f.sync_all()?;
 
+        fs::rename(ss_path_tmp, ss_path_final)?;
+        if let Some(dir) = ss_path_final.parent() {
+            // always should have parent
+            File::open(dir)?.sync_all()?;
+        }
+
         Ok(f)
+    }
+}
+
+pub enum FlushingThreadResponse {
+    Success(SSTable, WAL),
+    SyncError(DbError),
+}
+struct FlushingManager {
+    tx: Sender<FlushingThreadResponse>,
+    rx: Receiver<FlushingThreadResponse>, // make a DbError::FlushError(and variations)
+}
+
+impl FlushingManager {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel::<FlushingThreadResponse>();
+        Self { tx, rx }
+    }
+
+    // main will poll and on success, will add the SST to active memory and delete old_wal from directory
+    fn background_flush_memtable(
+        &mut self,
+        frozen: Arc<AVL>,
+        old_wal: WAL,
+        ss_path_tmp: PathBuf,
+        ss_path_final: PathBuf,
+    ) -> Result<()> {
+        let tx: Sender<FlushingThreadResponse> = self.tx.clone();
+        spawn(move || -> Result<()> {
+            let f = match frozen.sync_avl(&ss_path_tmp, &ss_path_final) {
+                Ok(f) => f,
+                Err(err) => {
+                    let _ = tx.send(FlushingThreadResponse::SyncError(err));
+                    return Err(DbError::ReportedViaChannel);
+                }
+            };
+
+            let sstable = SSTable::load(&ss_path_final);
+
+            let _ = tx.send(FlushingThreadResponse::Success(sstable, old_wal));
+
+            Ok(())
+        });
+
+        Ok(())
+    }
+    fn background_flush_wal(&mut self, wal: WAL) {
+        let tx: Sender<FlushingThreadResponse> = self.tx.clone();
+        unimplemented!()
     }
 }
 struct KVEngine {
     data_directory: PathBuf,
-    sstables: Option<Vec<SSTable>>,
-    curr_file_buffer: Option<BufWriter<File>>, // have a curr file to be the file you are currently writing on
+    sstables: Option<Arc<RwLock<Vec<SSTable>>>>,
+    curr_file_buffer: Option<BufWriter<File>>,
     curr_file_path: Option<PathBuf>,
     curr_file_offset: u64,
     sync_config: SyncConfig,
     wal: WAL,
     memtable: AVL,
-    flushing_memtable: Option<Arc<AVL>>,
+    flushing_memtable: Option<Weak<AVL>>,
     corrupted_files: HashSet<FileId>,
+    flushing_manager: FlushingManager,
 }
 
 impl KVEngine {
-    fn create_new_data_file(dir: &Path) -> io::Result<(File, PathBuf)> {
+    fn create_new_data_file(dir: &Path) -> io::Result<(File, PathBuf, PathBuf)> {
         let tstamp = new_timestamp();
-        let data_file_path = dir.join(format!("{}.sst", tstamp));
+        let data_file_path_final = dir.join(format!("{}.sst", tstamp));
+        let data_file_path_tmp = dir.join(format!("{}.sst.tmp", tstamp));
         let data_file = OpenOptions::new()
             .read(true)
             .append(true)
-            .create(true)
-            .open(&data_file_path)?;
-        Ok((data_file, data_file_path))
+            .create_new(true)
+            .open(&data_file_path_tmp)?;
+        Ok((data_file, data_file_path_tmp, data_file_path_final))
     }
 
     // threshold and sync_config can be part of one config struct later.
@@ -637,32 +728,11 @@ impl KVEngine {
         let path = PathBuf::from(dir_name);
 
         let mut sstables: Vec<SSTable> = Vec::new();
-
-        for entry in fs::read_dir(dir_name)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            println!("Name: {}", path.display());
-
-            let ext = match path.extension().and_then(|x| x.to_str()) {
-                Some(e) => e,
-                _ => continue,
-            };
-            if ext == "sst" {
-                let ss_table = SSTable::load(&path);
-                sstables.push(ss_table);
-            }
-        }
-
-        sstables.sort_by_key(|p| p.id);
-
         let memtable = AVL::new(MEMTABLE_THRESHOLD);
 
-        let wal_path = dir_name.join("walfile.wal");
-
         let wal = WAL::new(threshold, sync_config)?;
+        let wal_path: &Path = wal.path.as_ref();
+        let wal_path_metadata = wal_path.metadata();
 
         let mut self_instance = Self {
             sstables: None,
@@ -674,30 +744,40 @@ impl KVEngine {
             memtable,
             flushing_memtable: None,
             wal,
+            flushing_manager: FlushingManager::new(),
             corrupted_files: HashSet::new(),
         };
-        if let Ok(wal_m) = wal_path.metadata()
-            && wal_m.len() > 0
-        {
-            self_instance.sync_wal()?;
-        }
 
-        if let Some(active_sstable) = sstables.pop() {
-            let ss_metadata = active_sstable.file.metadata()?;
-            if ss_metadata.len() >= MAX_FILE_SIZE {
-                self_instance.rotate_active_file()?; // TODO
-            } else {
-                self_instance.curr_file_buffer =
-                    Some(BufWriter::with_capacity(256000, active_sstable.file));
-                self_instance.curr_file_path = Some(active_sstable.file_path.clone());
-                self_instance.curr_file_offset = ss_metadata.len();
+        for entry in fs::read_dir(dir_name)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
             }
-        } else {
-            // first run, no sstables yyet
-            self_instance.rotate_active_file()?;
+
+            let ext = match path.extension().and_then(|x| x.to_str()) {
+                Some(e) => e,
+                _ => continue,
+            };
+            if ext == "sst" {
+                let ss_table = SSTable::load(&path);
+                sstables.push(ss_table);
+            } else if ext == "wal" {
+                // flush old wals to disk
+                // TODO
+                self_instance.wal.sync_wal(&path);
+            }
         }
 
-        self_instance.sstables = Some(sstables);
+        sstables.sort_by_key(|p| p.id);
+
+        // if let Ok(wal_m) = wal_path_metadata
+        //     && wal_m.len() > 0
+        // {
+        //     self_instance.wal.sync_wal()?;
+        // }
+
+        self_instance.sstables = Some(Arc::new(RwLock::new(sstables)));
         Ok(self_instance)
     }
 
@@ -820,9 +900,10 @@ impl KVEngine {
         }
         Ok(None)
     }
-    fn search_for_kv_in_sstables(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    fn search_for_kv_in_sstables(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if let Some(sstables) = &self.sstables {
-            for element in sstables.iter() {
+            // Lock here is held for the entirety of the loop. Ok for now, mostly reads, rare writes
+            for element in sstables.read().unwrap().iter() {
                 match Self::should_search_sstable_file(key, element) {
                     true => {
                         if let Some(sstable) = Self::search_kv_in_sstable(element, key)? {
@@ -837,7 +918,13 @@ impl KVEngine {
     }
 
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let val = self.memtable.get(key);
+        let flushing = self.flushing_memtable.as_ref().and_then(|x| x.upgrade());
+
+        let val = flushing
+            .as_ref()
+            .and_then(|x| x.get(key))
+            .or_else(|| self.memtable.get(key));
+
         if let Some(c) = val {
             Ok(Some(c.to_vec()))
         } else {
@@ -849,8 +936,7 @@ impl KVEngine {
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        match ((key.len() as u64 + value.len() as u64 + self.memtable.size) as u64)
-            < self.memtable.threshold
+        match (key.len() as u64 + value.len() as u64 + self.memtable.size) < self.memtable.threshold
         {
             true => {
                 self.memtable.put(key, value);
@@ -861,20 +947,20 @@ impl KVEngine {
                 self.memtable.put(key, value);
             }
         }
+        self.wal.record_to_wal(key, value, false)?;
 
         Ok(())
     }
 
-    fn sync_wal(&mut self) -> io::Result<()> {
-        unimplemented!()
-        // reads wal and writes to disk
-        // gets called if a crash occurs, if no crash, judt delete wal safely
+    fn delete(&mut self, key: &[u8]) -> Result<()> {
+        self.memtable.delete(key);
+        Ok(())
     }
+
     fn sync_memtable(memtable: AVL) {
         unimplemented!()
     }
     fn sync(&mut self) -> io::Result<()> {
-        // forces any writes to sync to disk
         if let Some(writer) = &mut self.curr_file_buffer {
             writer.flush()?;
             writer.get_ref().sync_all()?;
@@ -888,52 +974,24 @@ impl KVEngine {
             &mut self.memtable,
             AVL::new(MEMTABLE_THRESHOLD),
         ));
-        self.flushing_memtable = Some(Arc::clone(&frozen));
+
+        self.flushing_memtable = Some(Arc::downgrade(&frozen));
         let old_wal = std::mem::replace(
             &mut self.wal,
             WAL::new(MEMTABLE_THRESHOLD, self.sync_config)?,
         );
-        let ss_path = KVEngine::create_new_data_file(&self.data_directory)?.1;
-        // What to do: Have the flushing thread have the frozen memtable as an Arc<> and the main thread can have it as a Weak and everytime we do a get we can check if we can upgrade to it in order to get the value we need
-        // once flushing_thread is done with Arc<memtable>, the main thread won't be able to upgrade to it so we are good
-        /*
-               if let Some(memtable) = self.flushing_memtable.upgrade() {
-        // if something is here we do memtable.get
-        } drops here and thats it
-                */
-        spawn(move || -> Result<File> {
-            let f = frozen.sync_avl(&ss_path)?;
-            // let sstable = SSTable::load(&old_path);
-            // files.push(sstable);
-            old_wal.destruct();
+        let (file, tmp_path, final_path) = KVEngine::create_new_data_file(&self.data_directory)?;
 
-            Ok(f)
-        });
-
-        // only delete the old wal when everything is flushed to disk. So when the thread we spawned finishes, we are clear to delete the old_wal and also delete the frozen memtable
+        let _ = self.flushing_manager.background_flush_memtable(
+            frozen,
+            old_wal,
+            tmp_path.clone(),
+            final_path,
+        );
 
         Ok(())
     }
 
-    fn rotate_active_file(&mut self) -> io::Result<()> {
-        if let Some(writer) = &mut self.curr_file_buffer {
-            writer.flush()?;
-        }
-        if let Some(old_path) = self.curr_file_path.take()
-            && let Some(files) = &mut self.sstables
-        {
-            let sstable = SSTable::load(&old_path);
-            files.push(sstable);
-        }
-
-        let new_data_file_tuple = KVEngine::create_new_data_file(&self.data_directory)?;
-
-        self.curr_file_buffer = Some(BufWriter::with_capacity(256000, new_data_file_tuple.0));
-        self.curr_file_path = Some(new_data_file_tuple.1);
-        self.curr_file_offset = 0;
-
-        Ok(())
-    }
     fn serialize_record(tstamp: u64, key: &[u8], value: &[u8]) -> Vec<u8> {
         let crc32 = Crc::<u32>::new(&CRC_32_ISO_HDLC);
         let body: Vec<u8> = [

@@ -28,6 +28,8 @@ pub enum DbError {
     Io(std::io::Error),
     FileError(String, PathBuf),
     MemTableSyncError(String),
+    ReportedViaChannel,
+    // FlushingError,
 }
 
 impl fmt::Display for CorruptionType {
@@ -72,6 +74,9 @@ impl fmt::Display for DbError {
             }
             Self::MemTableSyncError(err) => {
                 write!(f, "Error while syncing memtable: {}", err)
+            }
+            Self::ReportedViaChannel => {
+                write!(f, "Error reported to main thread via channel. ")
             }
         }
     }
