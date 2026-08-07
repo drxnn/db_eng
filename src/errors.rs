@@ -19,6 +19,8 @@ pub enum CorruptionType {
     Other(String),
     LengthMismatch { expected: usize, found: usize },
     BufferExceedsMaxLength { size: u64, max_size: u64 },
+    MetadataSizeOverflow { sizes: [u64; 4] },
+    MetaDataSizeExceedsFileSize { file_size: u64, metadata_size: u64 },
 }
 
 #[derive(Debug)]
@@ -46,6 +48,23 @@ impl fmt::Display for CorruptionType {
             }
             Self::BufferExceedsMaxLength { size, max_size } => {
                 write!(f, "Buffer Size: {}. Max size allowed: {}", size, max_size)
+            }
+            Self::MetadataSizeOverflow { sizes } => {
+                write!(
+                    f,
+                    "Corruption in metadata footer. Sizes overflow. Sparse_index_size:{}. Bloom_filter_size:{}. Min_key_size:{}. Max_key_size:{}",
+                    sizes[0], sizes[1], sizes[2], sizes[3]
+                )
+            }
+            Self::MetaDataSizeExceedsFileSize {
+                file_size,
+                metadata_size,
+            } => {
+                write!(
+                    f,
+                    "Metadata size exceeds file size: File_size: {}. Metadata_size:{}",
+                    file_size, metadata_size
+                )
             }
         }
     }
