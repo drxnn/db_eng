@@ -13,10 +13,13 @@ use std::thread::spawn;
 use std::unimplemented;
 
 use crate::errors::CorruptionType::Other;
+use crate::errors::DbError::SyncFail;
 use crate::errors::{CorruptionType, DataCorruptedErr, DbError, Result};
 use crate::helpers::{
     NUM_HASHES, compute_crc, compute_crc_data_block, get_hashed_key_positions, new_timestamp,
 };
+use crate::lsm::Lookup::{Absent, Deleted, Found};
+
 use std::cmp::{Ordering, max};
 
 const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024; // SUBJECT TO CHANGE
@@ -37,8 +40,15 @@ enum SyncConfig {
     Always,     // Ddurable
 }
 
+enum Lookup<'a> {
+    Found(&'a [u8]),
+    Deleted,
+    Absent,
+}
+
 struct BloomFilter {
     bits: Vec<u64>,
+    // num_bits is used by get_hashed_key_positions as a modulus so even though we pad the bits to a whole u64 word, num_bits is still the logical count so still read/write num_bits to footer as is.
     num_bits: u64,
 }
 
@@ -48,7 +58,7 @@ enum WalRecordType<'a> {
 }
 
 struct SparseIndex {
-    index_entries: Vec<Vec<u8>>, // PROBLEM: Rethink this really fast, doesnt need to be a Vector of Vectors just push bytes into it
+    index_entries: Vec<u8>,
     size: u64,
 }
 
@@ -59,17 +69,17 @@ impl SparseIndex {
             size: 0,
         }
     }
-    fn add_entry(&mut self, ss_data_block: SsTableDataBlock, offset: u64) {
-        let full_block = ss_data_block.full_data_block();
-        let first_keysz = (full_block.starting_key.len() as u64).to_le_bytes();
-        let data_block_sz = (full_block.bytes.len() as u64).to_le_bytes();
-        let mut sparse_entry: Vec<u8> = Vec::new();
+    fn add_entry(&mut self, starting_key: &[u8], data_len: u64, offset: u64) {
+        // data_len = block length WITHOUT 4 Byte CRC
+        let first_keysz = (starting_key.len() as u64).to_le_bytes();
+        let data_block_sz = data_len.to_le_bytes();
+
         // sparse index: sizeof(k), k, offset, datablock_size);
-        sparse_entry.extend_from_slice(&first_keysz);
-        sparse_entry.extend_from_slice(&full_block.starting_key);
-        sparse_entry.extend_from_slice(&offset.to_le_bytes());
-        sparse_entry.extend_from_slice(&data_block_sz);
-        self.index_entries.push(sparse_entry);
+        self.index_entries.extend_from_slice(&first_keysz);
+        self.index_entries.extend_from_slice(starting_key);
+        self.index_entries.extend_from_slice(&offset.to_le_bytes());
+        self.index_entries.extend_from_slice(&data_block_sz);
+        self.size += 1;
     }
 
     fn parse_sparse_index(b: &[u8]) -> Vec<(Vec<u8>, u64, u64)> {
@@ -96,9 +106,10 @@ impl SparseIndex {
 impl BloomFilter {
     fn new(num_bits: usize) -> Self {
         let words_for_bits = num_bits.div_ceil(64);
+
         Self {
             bits: vec![0u64; words_for_bits],
-            num_bits: num_bits as u64,
+            num_bits: (words_for_bits * 64) as u64,
         }
     }
 
@@ -257,16 +268,10 @@ impl SSTable {
         let mut footer = [0u8; 40];
         f.read_exact(&mut footer)?;
         let file_length = f.metadata()?.len();
-        // get data lengths from footer, and offsets
-        // then read all the data you need to one buffer, then slice into it for each value
-        // this can inside a deserialize_footer function instead of here
-        //PROBLEM: make sure sizes are safe, could be corrupted data.
-        // PROBLEM 1.1: I dont need to save everything in the footer. For example, bloom filter offset can be found by doing sparse_i_offset + sparse_i_size
-        // footer is: sparse_index | bloom_f | min_k | max_k | (footer starts here -> ) sparse_index_offset | sparse_index_size | bloom_filter_size | min_k size | max_k_size
-        // 40 bytes instead of 64
+
         let sparse_index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
         let size_of_sparse_index = u64::from_le_bytes(footer[8..16].try_into().unwrap());
-        let size_of_bloom_filter = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+        let size_of_bloom_filter = u64::from_le_bytes(footer[16..24].try_into().unwrap()); // byte count of vector
         let size_of_min_key = u64::from_le_bytes(footer[24..32].try_into().unwrap());
         let size_of_max_key = u64::from_le_bytes(footer[32..40].try_into().unwrap());
 
@@ -317,9 +322,17 @@ impl SSTable {
         let min_key = &full_sst_data[(min_k_start as usize)..(min_k_end as usize)];
         let max_k = &full_sst_data[(max_k_start as usize)..(max_k_end as usize)];
 
+        // SAFE unless data is corrupted
+        // if
         let bloomf_filter_64 = bloom_filter
             .chunks_exact(8)
-            .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+            .map(|chunk| {
+                u64::from_le_bytes(
+                    chunk
+                        .try_into()
+                        .expect("bloom_filter not divided in 64 bit chunks, data corrupted"),
+                )
+            })
             .collect();
 
         let parsed_sparse_index = SparseIndex::parse_sparse_index(sparse_index);
@@ -333,7 +346,7 @@ impl SSTable {
             sparse_index: parsed_sparse_index,
             bloom_filter: BloomFilter {
                 bits: bloomf_filter_64,
-                num_bits: (size_of_bloom_filter / 8),
+                num_bits: (size_of_bloom_filter * 8),
             },
             corrupted: false,
         })
@@ -374,7 +387,6 @@ struct AVL {
     root: Option<Box<Node>>,
     threshold: u64,
     size: u64,
-    buf_file: Option<BufWriter<File>>, // to write to sstable on flush
 }
 #[derive(PartialEq, Clone, Debug)]
 struct AvlEntry {
@@ -416,25 +428,26 @@ impl AVL {
             root: None,
             threshold,
             size: 0,
-            buf_file: None,
         }
     }
 
-    fn get(&self, key: &[u8]) -> Option<&[u8]> {
-        if let Some(mut curr) = self.root.as_ref() {
-            loop {
-                if curr.entry.key == key {
-                    return Some(&curr.entry.value);
-                }
-                if curr.entry.key.as_slice() > key {
-                    curr = curr.left.as_ref()?;
+    fn get(&self, key: &[u8]) -> Lookup {
+        let mut current = self.root.as_ref();
+        while let Some(curr) = current {
+            if curr.entry.key == key {
+                if !curr.entry.deleted {
+                    return Found(&curr.entry.value);
                 } else {
-                    curr = curr.right.as_ref()?;
+                    return Deleted;
                 }
             }
-        } else {
-            None
+            if curr.entry.key.as_slice() > key {
+                current = curr.left.as_ref();
+            } else {
+                current = curr.right.as_ref();
+            }
         }
+        Absent
     }
 
     fn update_height(node: &mut Box<Node>) {
@@ -661,30 +674,17 @@ impl AVL {
         sizeof_si: u64,
         sizeof_bf: u64,
     ) -> Vec<u8> {
-        // returns the footer
-        // | min key | max key | sizeof(sparse_index) | sparse_index_offset| sizeof(bloom_filter) | bloom filter_offset | sizeof(minkey) | minkey offset | sizeof(maxkey) | maxkey offset |
-        // PROBLEM: Change the footer to be 40 bytes like the fn load reads it
         let mut footer: Vec<u8> = Vec::new();
-        // offset is start_of_sparse_index
 
-        // TODO: I dont need to save all the offsets necessarily in the footer. They can mostly be derived from other offsets = si_offset + size
-        // Come up with a more space efficient footer. Works for now
-        let min_key_offset = *offset + sizeof_bf + sizeof_si;
-        let max_key_offset = min_key_offset + max_key.len() as u64;
         footer.extend_from_slice(min_key);
         footer.extend_from_slice(max_key);
-        footer.extend_from_slice(&sizeof_si.to_le_bytes());
+
         footer.extend_from_slice(&offset.to_le_bytes());
-        *offset += sizeof_si;
+        footer.extend_from_slice(&sizeof_si.to_le_bytes());
         footer.extend_from_slice(&sizeof_bf.to_le_bytes());
-        footer.extend_from_slice(&offset.to_le_bytes()); //bf offset
         footer.extend_from_slice(&(min_key.len() as u64).to_le_bytes());
-
-        footer.extend_from_slice(&min_key_offset.to_le_bytes());
         footer.extend_from_slice(&(max_key.len() as u64).to_le_bytes());
-        footer.extend_from_slice(&max_key_offset.to_le_bytes());
 
-        // serialize the footer, sparse_index
         footer
     }
 
@@ -704,12 +704,13 @@ impl AVL {
                     true => {
                         let owned_ss_data_block =
                             data_block.take().expect("Expected a SsTableDataBlock");
+                        let data_len = owned_ss_data_block.bytes.len() as u64; // before 4 byte crc
+                        let full = owned_ss_data_block.full_data_block();
 
-                        writer.write_all(&owned_ss_data_block.bytes)?;
+                        writer.write_all(&full.bytes)?; // including 4 byte crc
 
-                        let data_block_len = owned_ss_data_block.bytes.len() as u64;
-                        sparse_index.add_entry(owned_ss_data_block, *offset);
-                        *offset += data_block_len;
+                        sparse_index.add_entry(&full.starting_key, data_len, *offset);
+                        *offset += full.bytes.len() as u64;
 
                         let mut new_ss_db = SsTableDataBlock::new(&x.entry.key);
                         new_ss_db.append_to_block(&x.serialize_kv());
@@ -730,8 +731,6 @@ impl AVL {
         }
         Ok(())
     }
-
-    // What if engine crashes mid sync_avl execution? // check if need to be called on start/restart
 
     fn sync_avl(&self, ss_path_tmp: &Path, ss_path_final: &Path) -> Result<File> {
         let mut writer_1 = BufWriter::new(File::create(ss_path_tmp)?);
@@ -761,23 +760,23 @@ impl AVL {
         if let Some(last_db) = data_block {
             let len = last_db.bytes.len() as u64;
 
-            writer_1.write_all(&last_db.bytes)?;
+            let full = last_db.full_data_block();
+            writer_1.write_all(&full.bytes)?;
 
-            sparse_index.add_entry(last_db, file_offset);
+            sparse_index.add_entry(&full.starting_key, len, file_offset);
 
-            file_offset += len; // length here is the start of sparse_index // 
+            file_offset += full.bytes.len() as u64; // length here is the start of sparse_index // 
         }
         let footer = Self::serialize_sstable_footer(
             &mut file_offset,
             min_k,
             max_k,
-            sparse_index.size,
-            bloom_filter.num_bits,
+            sparse_index.index_entries.len() as u64,
+            (bloom_filter.bits.len() * 8) as u64, // multiply by 8, needed for reading the u8s during load
         );
 
-        for entry in &sparse_index.index_entries {
-            writer_1.write_all(entry)?;
-        }
+        writer_1.write_all(&sparse_index.index_entries)?;
+
         for word in &bloom_filter.bits {
             writer_1.write_all(&word.to_le_bytes())?;
         }
@@ -803,11 +802,11 @@ impl AVL {
 
 pub enum FlushingThreadResponse {
     Success(SSTable),
-    SyncError(DbError),
+    Error(DbError),
 }
 struct FlushingManager {
     tx: Sender<FlushingThreadResponse>,
-    rx: Receiver<FlushingThreadResponse>, // make a DbError::FlushError(and variations)
+    rx: Receiver<FlushingThreadResponse>,
 }
 
 impl FlushingManager {
@@ -823,19 +822,20 @@ impl FlushingManager {
         ss_path_tmp: PathBuf,
         ss_path_final: PathBuf,
     ) -> Result<()> {
-        // PROBLEM: make sure all potential errors here are handled, no silenced errors
         let tx: Sender<FlushingThreadResponse> = self.tx.clone();
         spawn(move || -> Result<()> {
             let f = match frozen.sync_avl(&ss_path_tmp, &ss_path_final) {
                 Ok(f) => f,
                 Err(err) => {
-                    let _ = tx.send(FlushingThreadResponse::SyncError(err));
+                    let _ = tx.send(FlushingThreadResponse::Error(DbError::SyncFail(
+                        Box::new(err),
+                        ss_path_final.to_path_buf(),
+                    )));
                     return Err(DbError::ReportedViaChannel);
                 }
             };
 
-            // PROBLEM: ?; on load and handle potential error
-            let sstable = SSTable::load(&ss_path_final);
+            let sstable = SSTable::load(&ss_path_final)?; //PROBLEM: if this fails, main thread doesnt know, send it via tx
 
             let _ = tx.send(FlushingThreadResponse::Success(sstable));
 
@@ -979,22 +979,22 @@ impl FlushingManager {
         path: &PathBuf,
         sst_tmp_path: &PathBuf,
         ss_final_path: &PathBuf,
-    ) -> Result<()> {
+    ) -> Result<SSTable> {
         let mut memtable = AVL::new(MEMTABLE_THRESHOLD);
         self.build_avl_from_wal(&mut memtable, path)?;
 
         let f = match memtable.sync_avl(sst_tmp_path, ss_final_path) {
             Ok(f) => f,
             Err(err) => {
-                // PROBLEM: No error exists for this failure, make it
-                return Err(DbError::ReportedViaChannel);
+                return Err(DbError::SyncFail(
+                    Box::new(err),
+                    ss_final_path.to_path_buf(),
+                ));
             }
         };
-        let sstable = SSTable::load(ss_final_path);
-        // Problem: Use ?; when loading and handle potential error
-        // Then return the ss table to main to be added to the list
+        let sstable = SSTable::load(ss_final_path)?;
 
-        Ok(())
+        Ok(sstable)
     }
 }
 struct KVEngine {
@@ -1006,7 +1006,7 @@ struct KVEngine {
     sync_config: SyncConfig,
     wal: WAL,
     frozen_wal: Option<WAL>,
-    memtable: AVL, // Problem: Might need to put in Arc<> for
+    memtable: AVL,
     flushing_memtable: Option<Weak<AVL>>,
     corrupted_files: HashSet<FileId>,
     flushing_manager: FlushingManager,
@@ -1062,8 +1062,9 @@ impl KVEngine {
                 Some(e) => e,
                 _ => continue,
             };
+            //TODO order them by sst first then by oldest -> newest, for better branch pred
             if ext == "sst" {
-                let ss_table = SSTable::load(&path);
+                let ss_table = SSTable::load(&path)?;
                 sstables.push(ss_table);
             } else if ext == "wal" {
                 // flush old wals to disk
@@ -1071,36 +1072,28 @@ impl KVEngine {
                 let (file, tmp_path, final_path) =
                     KVEngine::create_new_data_file(&self_instance.data_directory)?;
                 // wal populates this and we flush it to disk as an .sst
-                let _ = self_instance.flushing_manager.retrieve_wal_records(
+                let sstable = self_instance.flushing_manager.retrieve_wal_records(
                     &path,
                     &tmp_path,
                     &final_path,
-                );
+                )?;
+                sstables.push(sstable);
             }
         }
 
         sstables.sort_by_key(|p| p.id);
-
-        // if let Ok(wal_m) = wal_path_metadata
-        //     && wal_m.len() > 0
-        // {
-        //     self_instance.wal.sync_wal()?;
-        // }
 
         self_instance.sstables = Some(Arc::new(RwLock::new(sstables)));
         Ok(self_instance)
     }
 
     fn should_search_sstable_file(key: &[u8], sstable: &SSTable) -> bool {
-        // checks the metadata of sstable and tells us whether we should look for the kv in the sstable
         if key > sstable.max_key.as_slice() || key < sstable.min_key.as_slice() {
             return false;
         }
-        let bf_size = sstable.bloom_filter.bits.len();
-        let bf_bit_positions = get_hashed_key_positions(key, bf_size);
-        bf_bit_positions
-            .iter()
-            .all(|&pos| *sstable.bloom_filter.bits.get(pos).unwrap() != 0)
+        let bf_bit_positions =
+            get_hashed_key_positions(key, sstable.bloom_filter.num_bits as usize);
+        sstable.bloom_filter.check_bits(bf_bit_positions)
     }
 
     fn search_kv_in_sstable(sstable: &SSTable, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -1122,14 +1115,15 @@ impl KVEngine {
 
         let mut crc = [0u8; 4];
 
-        // PROBLEM: Lets switch to read_exact_at here since buffer isnt reused
         let mut reader = BufReader::new(&sstable.file);
+        // just read the entire data_buffer instead of using a BufReader
         reader.seek(SeekFrom::Start(offset))?;
 
         reader.read_exact(&mut data_buffer)?;
 
         //
         // we read CRC here because data_len above doesnt take into account the 4 bytes for crc
+
         reader.read_exact(&mut crc)?;
         let crc_from_buff = u32::from_le_bytes(crc);
 
@@ -1204,7 +1198,7 @@ impl KVEngine {
                     continue;
                 }
                 Ordering::Equal => {
-                    if *deleted == 1 {
+                    if *deleted == 0xFF {
                         return Ok(None);
                     }
                     return Ok(Some(value.to_vec()));
@@ -1234,19 +1228,20 @@ impl KVEngine {
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let flushing = self.flushing_memtable.as_ref().and_then(|x| x.upgrade());
 
-        let val = flushing
-            .as_ref()
-            .and_then(|x| x.get(key))
-            .or_else(|| self.memtable.get(key));
-
-        if let Some(c) = val {
-            Ok(Some(c.to_vec()))
-        } else {
-            match self.search_for_kv_in_sstables(key)? {
-                Some(v) => Ok(Some(v)),
-                _ => Ok(None),
+        match self.memtable.get(key) {
+            Found(bytes) => return Ok(Some(bytes.to_vec())),
+            Deleted => return Ok(None),
+            Absent => {} // fall through
+        }
+        if let Some(frozen_mem) = flushing.as_ref() {
+            match frozen_mem.get(key) {
+                Found(bytes) => return Ok(Some(bytes.to_vec())),
+                Deleted => return Ok(None),
+                Absent => {}
             }
         }
+
+        self.search_for_kv_in_sstables(key) // if we get here, 
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -1324,7 +1319,7 @@ impl KVEngine {
 }
 
 /*Notes:
- // footer is :  | min key | max key | sizeof(sparse_index) | sparse_index_offset| sizeof(bloom_filter) | bloom filter_offset | sizeof(minkey) | minkey offset | sizeof(maxkey) | maxkey offset | 64 bytes(not including min and max key)
+ // footer is :  | min key | max key |  sparse_index_offset| sizeof(sparse_index) | sizeof(bloom_filter) | sizeof(minkey) | sizeof(maxkey) | 40 bytes(not including min and max key)
 DataBlocks:  [ tstamp(8) | ksz(8) | value_sz(8) | key | value  tstamp(8) | ksz(8) | value_sz(8) | key | value ... crc(4)]
 SSTable: Datablock1 | DataBlock2 ... Datablock N | Footer
 Bloom filter: k-hash bit array per SSTable to skip files on negative lookups. Use 10 bits per key. Built during flush of AVL.
@@ -1352,6 +1347,6 @@ deletedflag 1 = deleted, 0 = alive
  RECORD can be tstamp | ksz | key |crc (4 bytes) OR it can be  | tstamp | ksz |vsz | key | value | crc(4 bytes)
  POTENTIAL PROBLEM: should I include sequence numbers for each k/v pair ?
  PROBLEM/UPDATE: make Bufreaders with capacity instead
- PROBLEM/OPT: metadata footer can
+
 
 */

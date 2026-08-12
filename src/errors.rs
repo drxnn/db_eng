@@ -3,6 +3,7 @@ use std::{
     error::Error,
     fmt::{Formatter, write},
     path::PathBuf,
+    write,
 };
 
 #[derive(Debug)]
@@ -31,9 +32,12 @@ pub enum DbError {
     FileError(String, PathBuf),
     MemTableSyncError(String),
     ReportedViaChannel,
-    // FlushingError,
+    SyncFail(Box<DbError>, PathBuf),
 }
 
+pub enum FlushingError {
+    SyncError(DbError),
+}
 impl fmt::Display for CorruptionType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -96,6 +100,14 @@ impl fmt::Display for DbError {
             }
             Self::ReportedViaChannel => {
                 write!(f, "Error reported to main thread via channel. ")
+            }
+            Self::SyncFail(err, path) => {
+                write!(
+                    f,
+                    "Error while syncing file {}. Err: {}",
+                    path.display(),
+                    err
+                )
             }
         }
     }

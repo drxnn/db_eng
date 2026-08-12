@@ -35,6 +35,7 @@ pub fn new_timestamp() -> u64 {
 }
 
 pub fn get_hashed_key_positions(key: &[u8], bloom_filter_size: usize) -> [usize; NUM_HASHES] {
+    //bloom_filter_size is size in bits
     let h_key = xxh3_128(key);
     let h1 = (h_key >> 64) as u64;
     let h2 = h_key as u64;
