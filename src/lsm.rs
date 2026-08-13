@@ -13,7 +13,7 @@ use std::thread::spawn;
 use std::unimplemented;
 
 use crate::errors::CorruptionType::Other;
-use crate::errors::DbError::SyncFail;
+
 use crate::errors::{CorruptionType, DataCorruptedErr, DbError, Result};
 use crate::helpers::{
     NUM_HASHES, compute_crc, compute_crc_data_block, get_hashed_key_positions, new_timestamp,
@@ -29,7 +29,7 @@ const MAX_BLOCK_SIZE: u64 = 1024 * 1024;
 const TAG_DELETION: u8 = 2;
 const TAG_INSERTION: u8 = 4;
 const KEY_MAX_BYTES_SIZE: u64 = 16384;
-const VALUE_MAX_BYTES_SIZE: u64 = 131072;
+pub const VALUE_MAX_BYTES_SIZE: u64 = 131072;
 
 // WAL config for flush
 
@@ -1033,8 +1033,6 @@ impl KVEngine {
         let memtable = AVL::new(MEMTABLE_THRESHOLD);
 
         let wal = WAL::new(threshold, sync_config)?;
-        let wal_path: &Path = wal.path.as_ref();
-        let wal_path_metadata = wal_path.metadata();
 
         let mut self_instance = Self {
             sstables: None,

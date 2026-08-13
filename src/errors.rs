@@ -22,12 +22,15 @@ pub enum CorruptionType {
     BufferExceedsMaxLength { size: u64, max_size: u64 },
     MetadataSizeOverflow { sizes: [u64; 4] },
     MetaDataSizeExceedsFileSize { file_size: u64, metadata_size: u64 },
+    KeyValueRecordExceedsMaxLength { max: u64, found: u64 },
+    TombstoneCorrupted { found: u8 }, // add value that was expected too, either 0xFF or 0x00
 }
 
 #[derive(Debug)]
 pub enum DbError {
     DataCorrupted(DataCorruptedErr),
     MissingKey(String),
+    MissingHeapEntry(String, PathBuf),
     Io(std::io::Error),
     FileError(String, PathBuf),
     MemTableSyncError(String),
@@ -70,6 +73,16 @@ impl fmt::Display for CorruptionType {
                     file_size, metadata_size
                 )
             }
+            Self::KeyValueRecordExceedsMaxLength { max, found } => {
+                write!(
+                    f,
+                    "Key/Value Exceeds Max Length. Max Length: {}. Found Length: {}",
+                    max, found
+                )
+            }
+            Self::TombstoneCorrupted { found } => {
+                write!(f, "Corrupted Tombstone. Instead found: {}", found)
+            }
         }
     }
 }
@@ -108,6 +121,9 @@ impl fmt::Display for DbError {
                     path.display(),
                     err
                 )
+            }
+            Self::MissingHeapEntry(s, p) => {
+                write!(f, "HeapEntryMissingError at {}. ErrMsg: {}", p.display(), s)
             }
         }
     }

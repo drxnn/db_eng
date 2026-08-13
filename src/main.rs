@@ -2,7 +2,7 @@ use crc::{CRC_32_ISO_HDLC, Crc};
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
-use std::mem;
+
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     collections::HashMap,
@@ -12,6 +12,7 @@ use std::{
 use crate::helpers::compute_crc;
 use std::cmp::max;
 
+mod compact;
 mod errors;
 mod helpers;
 mod lsm;
