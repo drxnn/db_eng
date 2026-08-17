@@ -249,7 +249,7 @@ pub struct SSTable {
 
 impl SSTable {
     // pass a path, reads footer of file and builds an SStable to have in memory for faster lookup
-    fn load(path: &Path) -> Result<Self> {
+    pub fn load(path: &Path) -> Result<Self> {
         // open reader of file
         // start reading backwards and return the metadata in a SST
         //// footer is :
@@ -835,9 +835,15 @@ impl FlushingManager {
                 }
             };
 
-            let sstable = SSTable::load(&ss_path_final)?; //PROBLEM: if this fails, main thread doesnt know, send it via tx
-
-            let _ = tx.send(FlushingThreadResponse::Success(sstable));
+            let sstable = SSTable::load(&ss_path_final);
+            match sstable {
+                Ok(sst) => {
+                    let _ = tx.send(FlushingThreadResponse::Success(sst));
+                }
+                Err(dberr) => {
+                    let _ = tx.send(FlushingThreadResponse::Error(dberr));
+                }
+            }
 
             Ok(())
         });
@@ -1049,34 +1055,44 @@ impl KVEngine {
             corrupted_files: HashSet::new(),
         };
 
+        let mut sst_vec: Vec<PathBuf> = Vec::new();
+        let mut wal_vec: Vec<PathBuf> = Vec::new();
+
+        // sort by
         for entry in fs::read_dir(dir_name)? {
             let entry = entry?;
             let path = entry.path();
             if !path.is_file() {
                 continue;
             }
-
-            let ext = match path.extension().and_then(|x| x.to_str()) {
-                Some(e) => e,
+            match path.extension().and_then(|x| x.to_str()) {
+                Some(e) => match e {
+                    "sst" => {
+                        sst_vec.push(path);
+                    }
+                    "wal" => {
+                        wal_vec.push(path);
+                    }
+                    _ => {}
+                },
                 _ => continue,
             };
-            //TODO order them by sst first then by oldest -> newest, for better branch pred
-            if ext == "sst" {
-                let ss_table = SSTable::load(&path)?;
-                sstables.push(ss_table);
-            } else if ext == "wal" {
-                // flush old wals to disk
-                // TODO
-                let (file, tmp_path, final_path) =
-                    KVEngine::create_new_data_file(&self_instance.data_directory)?;
-                // wal populates this and we flush it to disk as an .sst
-                let sstable = self_instance.flushing_manager.retrieve_wal_records(
-                    &path,
-                    &tmp_path,
-                    &final_path,
-                )?;
-                sstables.push(sstable);
-            }
+        }
+
+        for path in sst_vec {
+            sstables.push(SSTable::load(&path)?);
+        }
+
+        for path in wal_vec {
+            let (_, tmp_path, final_path) =
+                KVEngine::create_new_data_file(&self_instance.data_directory)?;
+            // wal populates this and we flush it to disk as an .sst
+            let sstable = self_instance.flushing_manager.retrieve_wal_records(
+                &path,
+                &tmp_path,
+                &final_path,
+            )?;
+            sstables.push(sstable);
         }
 
         sstables.sort_by_key(|p| p.id);
@@ -1326,23 +1342,15 @@ Bloom filter: k-hash bit array per SSTable to skip files on negative lookups. Us
 // wal record looks like: ksz, vsz, k, v, crc(4 bytes)
 // When you read a data block in the sparse index, remember to account for the 4 crc bytes yourself, they are not accounted forin the length
 /*
-TODOS:
-Build SSTables on open to have the metadata in memory.
-Need to rewrite the delete function. Right now I am removing the Node from the tree but this can cause a bug:
-if you delete a key thats in the memtable, you remove the node, but what if its in one of the SStables?
-since the memtable hasnt been flushed yet, you will check memtable -> not found then check ss table and return the value even though
-it was deleted.
-So instead of removing the node, just add a tombstone on deletes. this means that the tree will just grow and now need to rebalance on deletes.
-On delete: just do insert(key, node) and have node.deleted true.
 
-On KVEngine get() you check if a kv is in the memtable, if yes, check the deleted flag.
-[ tstamp(8) | ksz(8) | value_sz(8) | deletedflag(1) | key | value ]
-deletedflag 1 = deleted, 0 = alive
+
+
+
 
 
  For WAL records, we have deletion and insertion types so far. Will use one byte to define type. 00000100(4) = INSERTION. 00000010(2) = DELETION.
  serialized should look like this: TYPE | RECORD
- RECORD can be tstamp | ksz | key |crc (4 bytes) OR it can be  | tstamp | ksz |vsz | key | value | crc(4 bytes)
+ WAL RECORD can be tstamp | ksz | key |crc (4 bytes) OR it can be  | tstamp | ksz |vsz | key | value | crc(4 bytes)
  POTENTIAL PROBLEM: should I include sequence numbers for each k/v pair ?
  PROBLEM/UPDATE: make Bufreaders with capacity instead
 

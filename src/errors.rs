@@ -27,6 +27,9 @@ pub enum CorruptionType {
 }
 
 #[derive(Debug)]
+
+// TODO: DbError is the umbrella for th errors, later on group errors together, for example CompactionErr, FlushingErrs etc as well as have
+// generic errors for everythign
 pub enum DbError {
     DataCorrupted(DataCorruptedErr),
     MissingKey(String),
@@ -36,6 +39,7 @@ pub enum DbError {
     MemTableSyncError(String),
     ReportedViaChannel,
     SyncFail(Box<DbError>, PathBuf),
+    CompactionError,
 }
 
 pub enum FlushingError {
@@ -124,6 +128,9 @@ impl fmt::Display for DbError {
             }
             Self::MissingHeapEntry(s, p) => {
                 write!(f, "HeapEntryMissingError at {}. ErrMsg: {}", p.display(), s)
+            }
+            Self::CompactionError => {
+                write!(f, "Compaction Error. Unfinished. ")
             }
         }
     }
