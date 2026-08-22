@@ -40,6 +40,7 @@ pub enum DbError {
     ReportedViaChannel,
     SyncFail(Box<DbError>, PathBuf),
     CompactionError,
+    DataBlockExhausted,
 }
 
 pub enum FlushingError {
@@ -131,6 +132,9 @@ impl fmt::Display for DbError {
             }
             Self::CompactionError => {
                 write!(f, "Compaction Error. Unfinished. ")
+            }
+            Self::DataBlockExhausted => {
+                write!(f, "Datablock exhausted. Unfinished. ")
             }
         }
     }

@@ -3,7 +3,7 @@ use crc::{CRC_32_ISO_HDLC, Crc};
 use core::num;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions, remove_file};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
@@ -46,10 +46,10 @@ enum Lookup<'a> {
     Absent,
 }
 
-struct BloomFilter {
-    bits: Vec<u64>,
+pub struct BloomFilter {
+    pub bits: Vec<u64>,
     // num_bits is used by get_hashed_key_positions as a modulus so even though we pad the bits to a whole u64 word, num_bits is still the logical count so still read/write num_bits to footer as is.
-    num_bits: u64,
+    pub num_bits: u64,
 }
 
 enum WalRecordType<'a> {
@@ -57,19 +57,19 @@ enum WalRecordType<'a> {
     Insertion(&'a [u8], &'a [u8]), // (key, value)
 }
 
-struct SparseIndex {
-    index_entries: Vec<u8>,
-    size: u64,
+pub struct SparseIndex {
+    pub index_entries: Vec<u8>,
+    pub size: u64,
 }
 
 impl SparseIndex {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             index_entries: Vec::new(),
             size: 0,
         }
     }
-    fn add_entry(&mut self, starting_key: &[u8], data_len: u64, offset: u64) {
+    pub fn add_entry(&mut self, starting_key: &[u8], data_len: u64, offset: u64) {
         // data_len = block length WITHOUT 4 Byte CRC
         let first_keysz = (starting_key.len() as u64).to_le_bytes();
         let data_block_sz = data_len.to_le_bytes();
@@ -86,7 +86,7 @@ impl SparseIndex {
         let mut out = Vec::new();
         // I am parsing this layout: ksz(8) | key(ksz) | offset(8) | datablock_sz(8)
         // to essentially => key | offset | datablock_sz (this lives in memory, the sparseIndex needs key to binary search. meanwhile the sparseIndex in the metadatafooter does need the key size)
-
+        // TODO: Ensure this is safe, data could be corrupted
         let mut current = 0;
         while current < b.len() {
             let ksz = u64::from_le_bytes(b[current..(current + 8)].try_into().unwrap());
@@ -104,7 +104,7 @@ impl SparseIndex {
 }
 
 impl BloomFilter {
-    fn new(num_bits: usize) -> Self {
+    pub fn new(num_bits: usize) -> Self {
         let words_for_bits = num_bits.div_ceil(64);
 
         Self {
@@ -113,7 +113,7 @@ impl BloomFilter {
         }
     }
 
-    fn set_bits(&mut self, positons: [usize; NUM_HASHES]) {
+    pub fn set_bits(&mut self, positons: [usize; NUM_HASHES]) {
         for position in positons {
             let word_idx = position / 64;
             let bit_idx = position % 64;
@@ -122,7 +122,7 @@ impl BloomFilter {
         }
     }
 
-    fn check_bits(&self, positons: [usize; NUM_HASHES]) -> bool {
+    pub fn check_bits(&self, positons: [usize; NUM_HASHES]) -> bool {
         for position in positons {
             let word_idx = position / 64;
             let bit_idx = position % 64;
@@ -204,35 +204,66 @@ impl WAL {
     }
 }
 
-struct SsTableDataBlock {
-    bytes: Vec<u8>, //[ tstamp(8) | ksz(8) | value_sz(8) | key | value ] ... crc(4) (crc for the entire datablock);
-    size: usize,
-    starting_key: Vec<u8>,
+pub struct SsTableDataBlock {
+    pub bytes: Cursor<Vec<u8>>, //[ tstamp(8) | ksz(8) | value_sz(8) | tombstone | key | value |  ] ... crc(4) (crc for the entire datablock);
+    pub size: usize,
+    pub starting_key: Vec<u8>,
 }
 
 impl SsTableDataBlock {
-    fn new(s_key: &[u8]) -> Self {
+    pub fn new(s_key: &[u8]) -> Self {
         // creates SsTableDataBlock
+
         Self {
-            bytes: Vec::new(),
+            bytes: Cursor::new(Vec::new()),
             size: 0,
             starting_key: s_key.to_vec(),
         }
     }
-    fn append_to_block(&mut self, entry: &[u8]) {
-        self.bytes.extend_from_slice(entry);
+    pub fn append_to_block(&mut self, entry: &[u8]) {
+        self.bytes.get_mut().extend_from_slice(entry);
+        // self.bytes.extend_from_slice(entry);
         self.size += entry.len();
     }
 
-    fn is_finished(&self) -> bool {
+    pub fn is_finished(&self) -> bool {
         self.size > DATA_BLOCK as usize
     }
 
-    fn full_data_block(mut self) -> Self {
-        let crc = compute_crc_data_block(&self.bytes);
-        self.bytes.extend_from_slice(&crc.to_le_bytes());
+    pub fn full_data_block(mut self) -> Self {
+        let crc = compute_crc_data_block(self.bytes.get_ref());
+        self.bytes.get_mut().extend_from_slice(&crc.to_le_bytes());
         self
     }
+
+    pub fn grab_max_key_from_data_block(&mut self) -> Result<Vec<u8>> {
+        let mut tstamp = [0u8; 8];
+        let mut ksz = [0u8; 8];
+        let mut vsz = [0u8; 8];
+        let mut tombstone: [u8; 1] = [0u8; 1];
+        let mut curr_max: Vec<u8> = vec![]; // function only gets called when there is a data block so it should never return this
+
+        while self.bytes.read_exact(&mut tstamp).is_ok() {
+            // when it throws eof, we have reached the end
+            self.bytes.read_exact(&mut ksz)?;
+            self.bytes.read_exact(&mut vsz)?;
+            self.bytes.read_exact(&mut tombstone)?;
+            let k_size = u64::from_le_bytes(ksz);
+            let v_size = u64::from_le_bytes(vsz);
+            let mut key = vec![0u8; k_size as usize];
+            let mut value = vec![0u8; v_size as usize];
+            self.bytes.read_exact(&mut key)?;
+            self.bytes.read_exact(&mut value)?;
+            curr_max = key;
+        }
+
+        self.bytes.set_position(0);
+        Ok(curr_max)
+    }
+}
+
+impl SsTableDataBlock {
+    pub fn get_next_record() {}
 }
 // put the cold data into a SStable cold data vector(sparse index, etc)* //
 pub struct SSTable {
@@ -242,7 +273,7 @@ pub struct SSTable {
     file_size: u64,
     min_key: Vec<u8>,
     max_key: Vec<u8>,
-    sparse_index: Vec<(Vec<u8>, u64, u64)>, // keysz | offset | datablock block length ( before CRC, which means you need to read the next 4 bytes and compute the crc)
+    sparse_index: Arc<Vec<(Vec<u8>, u64, u64)>>, // key | offset | datablock block length ( before CRC, which means you need to read the next 4 bytes and compute the crc)
     bloom_filter: BloomFilter,
     corrupted: bool,
 }
@@ -343,7 +374,7 @@ impl SSTable {
             file_size: file_length,
             min_key: min_key.to_vec(),
             max_key: max_k.to_vec(),
-            sparse_index: parsed_sparse_index,
+            sparse_index: Arc::new(parsed_sparse_index),
             bloom_filter: BloomFilter {
                 bits: bloomf_filter_64,
                 num_bits: (size_of_bloom_filter * 8),
@@ -383,7 +414,7 @@ impl SSTable {
         best_candidate
     }
 }
-struct AVL {
+pub struct AVL {
     root: Option<Box<Node>>,
     threshold: u64,
     size: u64,
@@ -667,7 +698,7 @@ impl AVL {
         Some(&curr.entry.key)
     }
 
-    fn serialize_sstable_footer(
+    pub fn serialize_sstable_footer(
         offset: &mut u64,
         min_key: &[u8],
         max_key: &[u8],
@@ -704,13 +735,13 @@ impl AVL {
                     true => {
                         let owned_ss_data_block =
                             data_block.take().expect("Expected a SsTableDataBlock");
-                        let data_len = owned_ss_data_block.bytes.len() as u64; // before 4 byte crc
+                        let data_len = owned_ss_data_block.bytes.get_ref().len() as u64; // before 4 byte crc
                         let full = owned_ss_data_block.full_data_block();
 
-                        writer.write_all(&full.bytes)?; // including 4 byte crc
+                        writer.write_all(full.bytes.get_ref())?; // including 4 byte crc
 
                         sparse_index.add_entry(&full.starting_key, data_len, *offset);
-                        *offset += full.bytes.len() as u64;
+                        *offset += full.bytes.get_ref().len() as u64;
 
                         let mut new_ss_db = SsTableDataBlock::new(&x.entry.key);
                         new_ss_db.append_to_block(&x.serialize_kv());
@@ -758,14 +789,14 @@ impl AVL {
         )?;
 
         if let Some(last_db) = data_block {
-            let len = last_db.bytes.len() as u64;
+            let len = last_db.bytes.get_ref().len() as u64;
 
             let full = last_db.full_data_block();
-            writer_1.write_all(&full.bytes)?;
+            writer_1.write_all(full.bytes.get_ref())?;
 
             sparse_index.add_entry(&full.starting_key, len, file_offset);
 
-            file_offset += full.bytes.len() as u64; // length here is the start of sparse_index // 
+            file_offset += full.bytes.get_ref().len() as u64; // length here is the start of sparse_index // 
         }
         let footer = Self::serialize_sstable_footer(
             &mut file_offset,

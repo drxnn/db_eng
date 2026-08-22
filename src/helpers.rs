@@ -34,11 +34,23 @@ pub fn new_timestamp() -> u64 {
         .as_nanos() as u64
 }
 
+// PROBLEM: Not cache friendly
+// split array into 64 byte blocks, then have one position from the hash function choose the block in the array and the rest to choose
+// the positions within that block, that way you dont jump around
 pub fn get_hashed_key_positions(key: &[u8], bloom_filter_size: usize) -> [usize; NUM_HASHES] {
-    //bloom_filter_size is size in bits
-    let h_key = xxh3_128(key);
-    let h1 = (h_key >> 64) as u64;
-    let h2 = h_key as u64;
+    get_positions_from_hashed_key(hash_key(key), bloom_filter_size)
+}
+
+pub fn hash_key(key: &[u8]) -> u128 {
+    xxh3_128(key)
+}
+
+pub fn get_positions_from_hashed_key(
+    hashed_key: u128,
+    bloom_filter_size: usize,
+) -> [usize; NUM_HASHES] {
+    let h1 = (hashed_key >> 64) as u64;
+    let h2 = hashed_key as u64;
 
     let mut arr: [usize; NUM_HASHES] = [0; NUM_HASHES];
     for i in 0..NUM_HASHES {
