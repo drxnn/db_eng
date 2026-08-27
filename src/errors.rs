@@ -2,6 +2,7 @@ use core::fmt;
 use std::{
     error::Error,
     fmt::{Formatter, write},
+    io,
     path::PathBuf,
     write,
 };
@@ -24,6 +25,7 @@ pub enum CorruptionType {
     MetaDataSizeExceedsFileSize { file_size: u64, metadata_size: u64 },
     KeyValueRecordExceedsMaxLength { max: u64, found: u64 },
     TombstoneCorrupted { found: u8 }, // add value that was expected too, either 0xFF or 0x00
+    TruncatedRecord,
 }
 
 #[derive(Debug)]
@@ -39,8 +41,38 @@ pub enum DbError {
     MemTableSyncError(String),
     ReportedViaChannel,
     SyncFail(Box<DbError>, PathBuf),
-    CompactionError,
+    CompactionError(CompactionErr),
     DataBlockExhausted,
+    TooManyFilesOpenInProcess,
+    TooManyFilesOpenInSystem,
+}
+
+impl From<io::Error> for DbError {
+    fn from(e: io::Error) -> Self {
+        #[cfg(target_os = "macos")]
+        match e.raw_os_error() {
+            Some(24) => return DbError::TooManyFilesOpenInProcess,
+            Some(23) => return DbError::TooManyFilesOpenInSystem,
+            _ => {}
+        }
+        #[cfg(target_os = "linux")]
+        match e.raw_os_error() {
+            Some(24) => return DbError::TooManyFilesOpenInProcess,
+            Some(23) => return DbError::TooManyFilesOpenInSystem,
+            _ => {}
+        }
+        #[cfg(windows)]
+        match e.raw_os_error() {
+            Some(4) => return DbError::TooManyFilesOpenInProcess,
+            _ => {}
+        }
+        DbError::Io(e)
+    }
+}
+#[derive(Debug)]
+pub enum CompactionErr {
+    HeapNotFound,
+    EmptyCompactionFileElementCollection,
 }
 
 pub enum FlushingError {
@@ -88,6 +120,9 @@ impl fmt::Display for CorruptionType {
             Self::TombstoneCorrupted { found } => {
                 write!(f, "Corrupted Tombstone. Instead found: {}", found)
             }
+            Self::TruncatedRecord => {
+                write!(f, "Trucated Record Found")
+            }
         }
     }
 }
@@ -130,19 +165,24 @@ impl fmt::Display for DbError {
             Self::MissingHeapEntry(s, p) => {
                 write!(f, "HeapEntryMissingError at {}. ErrMsg: {}", p.display(), s)
             }
-            Self::CompactionError => {
-                write!(f, "Compaction Error. Unfinished. ")
-            }
+            Self::CompactionError(c) => match c {
+                CompactionErr::EmptyCompactionFileElementCollection => {
+                    write!(f, "Empty CFE collection during compaction. ")
+                }
+                CompactionErr::HeapNotFound => {
+                    write!(f, "Empty Heap during compaction. ")
+                }
+            },
             Self::DataBlockExhausted => {
                 write!(f, "Datablock exhausted. Unfinished. ")
             }
+            Self::TooManyFilesOpenInProcess => {
+                write!(f, "errno: 24. Too many open files in the proccess.")
+            }
+            Self::TooManyFilesOpenInSystem => {
+                write!(f, "errno: 23. Too many open files in the system.")
+            }
         }
-    }
-}
-
-impl From<std::io::Error> for DbError {
-    fn from(value: std::io::Error) -> Self {
-        DbError::Io(value)
     }
 }
 

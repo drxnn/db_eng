@@ -16,19 +16,23 @@ use crate::errors::CorruptionType::Other;
 
 use crate::errors::{CorruptionType, DataCorruptedErr, DbError, Result};
 use crate::helpers::{
-    NUM_HASHES, compute_crc, compute_crc_data_block, get_hashed_key_positions, new_timestamp,
+    NUM_HASHES, compute_crc, compute_crc_data_block, create_new_data_file,
+    get_hashed_key_positions, new_timestamp,
 };
 use crate::lsm::Lookup::{Absent, Deleted, Found};
 
-use std::cmp::{Ordering, max};
+use std::cmp::{Ordering, Reverse, max};
 
 const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024; // SUBJECT TO CHANGE
-const MEMTABLE_THRESHOLD: u64 = 4 * 1024 * 1024; // SUBJECT TO CHANGE
+const MEMTABLE_THRESHOLD: u64 = 8 * 1024 * 1024; // SUBJECT TO CHANGE
+// this means L0 sstables are 8 mb, so we usually compact all L0 sstablse with all L1 sstables to a single L1 sstable.
 const DATA_BLOCK: u16 = 8 * 1024; // Data block in SSTable
+pub const DATA_BLOCK_MAX_BYTES_SIZE: u64 = 155673; // 8192(max db_size) + KEY_MAX_BYTES_SIZE + VALUE_MAX_BYTES_SIZE + 25 bytes for metadata(timestamp, ksz,vsz,tmbstone); // if we had a db_size of 8191, we could end up with adding a max val and max key
 const MAX_BLOCK_SIZE: u64 = 1024 * 1024;
+pub const MAX_SST_SIZE: u64 = 1024 * 1024 * 160;
 const TAG_DELETION: u8 = 2;
 const TAG_INSERTION: u8 = 4;
-const KEY_MAX_BYTES_SIZE: u64 = 16384;
+pub const KEY_MAX_BYTES_SIZE: u64 = 16384;
 pub const VALUE_MAX_BYTES_SIZE: u64 = 131072;
 
 // WAL config for flush
@@ -40,8 +44,8 @@ enum SyncConfig {
     Always,     // Ddurable
 }
 
-enum Lookup<'a> {
-    Found(&'a [u8]),
+enum Lookup {
+    Found(Vec<u8>),
     Deleted,
     Absent,
 }
@@ -149,7 +153,7 @@ struct WAL {
 impl WAL {
     fn new(threshold: u64, sync_c: SyncConfig) -> io::Result<WAL> {
         let tstamp = new_timestamp();
-        let wal_path = PathBuf::from(format!("{}.wal", tstamp));
+        let wal_path = PathBuf::from(format!("{}.wal", tstamp)); // TODO: put the wal in the directory
         let wal_file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -236,6 +240,25 @@ impl SsTableDataBlock {
         self
     }
 
+    pub fn grab_min_key_from_data_block(&mut self) -> Result<Vec<u8>> {
+        let mut tstamp = [0u8; 8];
+        let mut ksz = [0u8; 8];
+        let mut vsz = [0u8; 8];
+        let mut tombstone: [u8; 1] = [0u8; 1];
+
+        self.bytes.read_exact(&mut tstamp)?;
+        self.bytes.read_exact(&mut ksz)?;
+        self.bytes.read_exact(&mut vsz)?;
+        self.bytes.read_exact(&mut tombstone)?;
+        let k_size = u64::from_le_bytes(ksz);
+        let v_size = u64::from_le_bytes(vsz);
+        let mut key = vec![0u8; k_size as usize];
+        let mut value = vec![0u8; v_size as usize];
+        self.bytes.read_exact(&mut key)?;
+        self.bytes.read_exact(&mut value)?;
+        self.bytes.set_position(0);
+        Ok(key.to_vec())
+    }
     pub fn grab_max_key_from_data_block(&mut self) -> Result<Vec<u8>> {
         let mut tstamp = [0u8; 8];
         let mut ksz = [0u8; 8];
@@ -254,7 +277,7 @@ impl SsTableDataBlock {
             let mut value = vec![0u8; v_size as usize];
             self.bytes.read_exact(&mut key)?;
             self.bytes.read_exact(&mut value)?;
-            curr_max = key;
+            curr_max = key.to_vec();
         }
 
         self.bytes.set_position(0);
@@ -262,9 +285,6 @@ impl SsTableDataBlock {
     }
 }
 
-impl SsTableDataBlock {
-    pub fn get_next_record() {}
-}
 // put the cold data into a SStable cold data vector(sparse index, etc)* //
 pub struct SSTable {
     id: u64,
@@ -418,6 +438,7 @@ pub struct AVL {
     root: Option<Box<Node>>,
     threshold: u64,
     size: u64,
+    size_in_bytes: u64,
 }
 #[derive(PartialEq, Clone, Debug)]
 struct AvlEntry {
@@ -427,6 +448,8 @@ struct AvlEntry {
 }
 #[derive(PartialEq, Clone, Debug)]
 struct Node {
+    // TODO: Node should actually carry timestamp, exactly at the time a Node is created
+    // Right now we get the timestamp when we serialize the kv which is basically called for everynode as we are flushing
     entry: AvlEntry,
     height: u64,
     left: Option<Box<Node>>,
@@ -459,6 +482,7 @@ impl AVL {
             root: None,
             threshold,
             size: 0,
+            size_in_bytes: 0,
         }
     }
 
@@ -467,7 +491,7 @@ impl AVL {
         while let Some(curr) = current {
             if curr.entry.key == key {
                 if !curr.entry.deleted {
-                    return Found(&curr.entry.value);
+                    return Found(curr.entry.value.to_vec());
                 } else {
                     return Deleted;
                 }
@@ -493,13 +517,20 @@ impl AVL {
         } else {
             -1
         };
-        node.height = 1 + max(left_height, right_height) as u64;
+        node.height = (1 + max(left_height, right_height)) as u64;
     }
     fn insert(&mut self, curr: Option<Box<Node>>, n: Node) -> Option<Box<Node>> {
         if let Some(mut node) = curr {
             if n.entry.key == node.entry.key {
                 node.entry.value = n.entry.value;
-                node.entry.deleted = n.entry.deleted;
+                if n.entry.deleted {
+                    node.entry.deleted = n.entry.deleted;
+                    // We do this here because we when we delete something, we dont delete the node, we just replace the value with an empty vector
+                    // and we mark it as deleted so when it gets flushed to memory, the deleted flag maps to a tombstone
+                    self.size_in_bytes -= node.entry.value.len() as u64;
+                    node.entry.deleted = n.entry.deleted;
+                }
+
                 return Some(node);
             }
             if n.entry.key < node.entry.key {
@@ -531,6 +562,7 @@ impl AVL {
         };
         let root = self.root.take();
         self.root = self.insert(root, n);
+        self.size_in_bytes += key.len() as u64 + value.len() as u64; // Doesnt count metadata for sst
         self.size += 1;
     }
 
@@ -642,43 +674,44 @@ impl AVL {
 
         let root = self.root.take();
         self.root = self.insert(root, node);
+        // self.size_in_bytes += key.len() as u64 + value.len() as u64; // Doesnt count metadata for sst
     }
-    fn delete_remove_node(&mut self, curr: Option<Box<Node>>, key: &[u8]) -> Option<Box<Node>> {
-        if let Some(mut node) = curr {
-            if node.entry.key == key {
-                if node.left.is_none() && node.right.is_none() {
-                    return None;
-                } else if node.right.is_some() != node.left.is_some() {
-                    // XOR
-                    // return the child
-                    if let Some(_x) = node.left.as_ref() {
-                        return node.left;
-                    } else {
-                        return node.right;
-                    }
-                } else {
-                    // safe to unwrap here
-                    let (successor, new_right) = Self::take_min(node.right.take().unwrap());
-                    {
-                        let succ = successor.unwrap();
-                        node.right = new_right;
-                        node.entry.value = succ.entry.value;
-                        node.entry.key = succ.entry.key;
-                    }
-                }
-                return Some(Self::balance(node));
-            }
+    // fn delete_remove_node(&mut self, curr: Option<Box<Node>>, key: &[u8]) -> Option<Box<Node>> {
+    //     if let Some(mut node) = curr {
+    //         if node.entry.key == key {
+    //             if node.left.is_none() && node.right.is_none() {
+    //                 return None;
+    //             } else if node.right.is_some() != node.left.is_some() {
+    //                 // XOR
+    //                 // return the child
+    //                 if let Some(_x) = node.left.as_ref() {
+    //                     return node.left;
+    //                 } else {
+    //                     return node.right;
+    //                 }
+    //             } else {
+    //                 // safe to unwrap here
+    //                 let (successor, new_right) = Self::take_min(node.right.take().unwrap());
+    //                 {
+    //                     let succ = successor.unwrap();
+    //                     node.right = new_right;
+    //                     node.entry.value = succ.entry.value;
+    //                     node.entry.key = succ.entry.key;
+    //                 }
+    //             }
+    //             return Some(Self::balance(node));
+    //         }
 
-            if node.entry.key.as_slice() < key {
-                node.right = self.delete_remove_node(node.right.take(), key);
-            } else {
-                node.left = self.delete_remove_node(node.left.take(), key);
-            }
-            Some(Self::balance(node))
-        } else {
-            curr
-        }
-    }
+    //         if node.entry.key.as_slice() < key {
+    //             node.right = self.delete_remove_node(node.right.take(), key);
+    //         } else {
+    //             node.left = self.delete_remove_node(node.left.take(), key);
+    //         }
+    //         Some(Self::balance(node))
+    //     } else {
+    //         curr
+    //     }
+    // }
 
     fn get_min_node(node: &Option<Box<Node>>) -> Option<&Vec<u8>> {
         let mut curr = node.as_ref()?;
@@ -699,7 +732,7 @@ impl AVL {
     }
 
     pub fn serialize_sstable_footer(
-        offset: &mut u64,
+        offset: u64,
         min_key: &[u8],
         max_key: &[u8],
         sizeof_si: u64,
@@ -764,7 +797,8 @@ impl AVL {
     }
 
     fn sync_avl(&self, ss_path_tmp: &Path, ss_path_final: &Path) -> Result<File> {
-        let mut writer_1 = BufWriter::new(File::create(ss_path_tmp)?);
+        let mut writer_1 = BufWriter::new(File::create(ss_path_tmp)?); // TODO: file already exists, rotate_memtable_and_wal creates it,
+        //
         let mut data_block: Option<SsTableDataBlock> = None;
 
         // sizeof(key) | key | offset | datablock block length ( before CRC )
@@ -799,7 +833,7 @@ impl AVL {
             file_offset += full.bytes.get_ref().len() as u64; // length here is the start of sparse_index // 
         }
         let footer = Self::serialize_sstable_footer(
-            &mut file_offset,
+            file_offset,
             min_k,
             max_k,
             sparse_index.index_entries.len() as u64,
@@ -1035,7 +1069,9 @@ impl FlushingManager {
     }
 }
 struct KVEngine {
-    data_directory: PathBuf,
+    data_directory: PathBuf, // data_directory now holds all .sst and .wal files
+    // TODO: Need a way to split ssts into levels, L0, L1, L2 ..
+    // Could be done with a manifest file that keeps metadata, but I can just do an easier way for now
     sstables: Option<Arc<RwLock<Vec<SSTable>>>>,
     curr_file_buffer: Option<BufWriter<File>>,
     curr_file_path: Option<PathBuf>,
@@ -1050,26 +1086,14 @@ struct KVEngine {
 }
 
 impl KVEngine {
-    fn create_new_data_file(dir: &Path) -> io::Result<(File, PathBuf, PathBuf)> {
-        let tstamp = new_timestamp();
-        let data_file_path_final = dir.join(format!("{}.sst", tstamp));
-        let data_file_path_tmp = dir.join(format!("{}.sst.tmp", tstamp));
-        let data_file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create_new(true)
-            .open(&data_file_path_tmp)?;
-        Ok((data_file, data_file_path_tmp, data_file_path_final))
-    }
-
     // threshold and sync_config can be part of one config struct later.
-    fn open(dir_name: &Path, sync_config: SyncConfig, threshold: u64) -> Result<KVEngine> {
+    fn open(dir_name: &Path, sync_config: SyncConfig) -> Result<KVEngine> {
         let path = PathBuf::from(dir_name);
 
         let mut sstables: Vec<SSTable> = Vec::new();
         let memtable = AVL::new(MEMTABLE_THRESHOLD);
 
-        let wal = WAL::new(threshold, sync_config)?;
+        let wal = WAL::new(MEMTABLE_THRESHOLD, sync_config)?;
 
         let mut self_instance = Self {
             sstables: None,
@@ -1115,8 +1139,7 @@ impl KVEngine {
         }
 
         for path in wal_vec {
-            let (_, tmp_path, final_path) =
-                KVEngine::create_new_data_file(&self_instance.data_directory)?;
+            let (_, tmp_path, final_path) = create_new_data_file(&self_instance.data_directory)?;
             // wal populates this and we flush it to disk as an .sst
             let sstable = self_instance.flushing_manager.retrieve_wal_records(
                 &path,
@@ -1126,7 +1149,7 @@ impl KVEngine {
             sstables.push(sstable);
         }
 
-        sstables.sort_by_key(|p| p.id);
+        sstables.sort_by_key(|p| Reverse(p.id)); // Descending order
 
         self_instance.sstables = Some(Arc::new(RwLock::new(sstables)));
         Ok(self_instance)
@@ -1141,9 +1164,9 @@ impl KVEngine {
         sstable.bloom_filter.check_bits(bf_bit_positions)
     }
 
-    fn search_kv_in_sstable(sstable: &SSTable, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    fn search_kv_in_sstable(sstable: &SSTable, key: &[u8]) -> Result<Lookup> {
         let Some((offset, data_len)) = sstable.binary_search_sparse_index(key) else {
-            return Ok(None);
+            return Ok(Absent);
         };
 
         if data_len > MAX_BLOCK_SIZE {
@@ -1244,25 +1267,27 @@ impl KVEngine {
                 }
                 Ordering::Equal => {
                     if *deleted == 0xFF {
-                        return Ok(None);
+                        return Ok(Deleted);
                     }
-                    return Ok(Some(value.to_vec()));
+                    return Ok(Found(value.to_vec()));
                 }
                 Ordering::Greater => break,
             }
         }
-        Ok(None)
+        Ok(Absent)
     }
     fn search_for_kv_in_sstables(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if let Some(sstables) = &self.sstables {
             // Lock here is held for the entirety of the loop. Ok for now, mostly reads, rare writes
             for element in sstables.read().unwrap().iter() {
                 match Self::should_search_sstable_file(key, element) {
-                    true => {
-                        if let Some(sstable) = Self::search_kv_in_sstable(element, key)? {
-                            return Ok(Some(sstable));
+                    true => match Self::search_kv_in_sstable(element, key)? {
+                        Found(k) => return Ok(Some(k)),
+                        Deleted => return Ok(None),
+                        Absent => {
+                            continue;
                         }
-                    }
+                    },
                     false => continue,
                 }
             }
@@ -1290,26 +1315,42 @@ impl KVEngine {
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        match (key.len() as u64 + value.len() as u64 + self.memtable.size) < self.memtable.threshold
-        {
-            true => {
-                self.memtable.put(key, value);
-            }
-            false => {
-                self.rotate_memtable_and_wal()?;
-
-                self.memtable.put(key, value);
-            }
-        }
         self.wal
             .record_to_wal(WalRecordType::Insertion(key, value))?;
+        if (key.len() as u64 + value.len() as u64 + self.memtable.size_in_bytes)
+            < self.memtable.threshold
+        {
+            self.memtable.put(key, value);
+        } else {
+            self.rotate_memtable_and_wal()?;
+
+            self.memtable.put(key, value);
+        }
 
         Ok(())
     }
 
     fn delete(&mut self, key: &[u8]) -> Result<()> {
-        self.memtable.delete(key);
+        // TODO: check size first
+        // Problem here: when we put a key value pair, we do memtable.size_in_bytes += (k.len() + val.len()) as u64;
+        // but when we delete, we insert the Node with the key and no value vector so we end up doing:
+        /*
+        if n.entry.key == node.entry.key {
+               node.entry.value = n.entry.value;
+               node.entry.deleted = n.entry.deleted;
+               return Some(node);
+           }
+           So technically the memtable size_in_bytes should go down by val.len() bytes because we are swapping with an empty vec
+           ^ Fixed
+            */
         self.wal.record_to_wal(WalRecordType::Deletion(key))?;
+        if (key.len() as u64 + self.memtable.size_in_bytes) < self.memtable.threshold {
+            self.memtable.delete(key);
+        } else {
+            self.rotate_memtable_and_wal()?;
+            self.memtable.delete(key);
+        }
+
         Ok(())
     }
 
@@ -1337,7 +1378,7 @@ impl KVEngine {
             WAL::new(MEMTABLE_THRESHOLD, self.sync_config)?,
         );
         self.frozen_wal = Some(old_wal);
-        let (file, tmp_path, final_path) = KVEngine::create_new_data_file(&self.data_directory)?;
+        let (file, tmp_path, final_path) = create_new_data_file(&self.data_directory)?;
 
         let _ =
             self.flushing_manager

@@ -1,3 +1,4 @@
+use crate::errors::Result;
 use crc::{CRC_32_ISO_HDLC, Crc};
 use xxhash_rust::xxh3::xxh3_128;
 pub const NUM_HASHES: usize = 7;
@@ -25,7 +26,16 @@ pub fn compute_crc_data_block(data: &[u8]) -> u32 {
     digest.finalize()
 }
 
-use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "macos")]
+use std::io::Error;
+use std::{
+    fs::{File, OpenOptions},
+    io,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use crate::errors::{DataCorruptedErr, DbError};
 
 pub fn new_timestamp() -> u64 {
     SystemTime::now()
@@ -58,4 +68,37 @@ pub fn get_positions_from_hashed_key(
     }
 
     arr
+}
+
+// helper for key and value record check only
+pub fn check_key_value_record_does_not_exceed_max(
+    size: u64,
+    max_size: u64,
+    offset: u64,
+    file_path: &PathBuf,
+) -> Result<()> {
+    if size > max_size {
+        Err(DbError::DataCorrupted(DataCorruptedErr {
+            offset,
+            file_path: file_path.to_path_buf(),
+            reason: crate::errors::CorruptionType::KeyValueRecordExceedsMaxLength {
+                max: max_size,
+                found: size,
+            },
+        }))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn create_new_data_file(dir: &Path) -> io::Result<(File, PathBuf, PathBuf)> {
+    let tstamp = new_timestamp();
+    let data_file_path_final = dir.join(format!("{}.sst", tstamp));
+    let data_file_path_tmp = dir.join(format!("{}.sst.tmp", tstamp));
+    let data_file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create_new(true)
+        .open(&data_file_path_tmp)?;
+    Ok((data_file, data_file_path_tmp, data_file_path_final))
 }
