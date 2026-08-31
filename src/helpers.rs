@@ -9,6 +9,7 @@ pub fn compute_crc(
     key: &[u8],
     value: &[u8],
 ) -> u32 {
+    // TODO: Do not call the new function below for every crc
     let crc32 = Crc::<u32>::new(&CRC_32_ISO_HDLC);
     let mut digest = crc32.digest();
     digest.update(timestamp);
@@ -54,6 +55,13 @@ pub fn get_hashed_key_positions(key: &[u8], bloom_filter_size: usize) -> [usize;
 pub fn hash_key(key: &[u8]) -> u128 {
     xxh3_128(key)
 }
+pub fn read_range(b: &[u8], start: usize, end: usize) -> Result<&[u8]> {
+    b.get(start..end).ok_or(DbError::OutOfBoundsRead {
+        start: start as u64,
+        end: end as u64,
+        len: b.len() as u64,
+    })
+}
 
 pub fn get_positions_from_hashed_key(
     hashed_key: u128,
@@ -64,7 +72,7 @@ pub fn get_positions_from_hashed_key(
 
     let mut arr: [usize; NUM_HASHES] = [0; NUM_HASHES];
     for i in 0..NUM_HASHES {
-        arr[i] = h1.wrapping_add(i as u64).wrapping_mul(h2) as usize % bloom_filter_size;
+        arr[i] = (h1.wrapping_add((i as u64).wrapping_mul(h2)) as usize) % bloom_filter_size;
     }
 
     arr

@@ -7,6 +7,8 @@ use std::{
     write,
 };
 
+use crate::errors::InvalidMemtableInput::KeySizeTooLarge;
+
 #[derive(Debug)]
 
 pub struct DataCorruptedErr {
@@ -25,7 +27,7 @@ pub enum CorruptionType {
     MetaDataSizeExceedsFileSize { file_size: u64, metadata_size: u64 },
     KeyValueRecordExceedsMaxLength { max: u64, found: u64 },
     TombstoneCorrupted { found: u8 }, // add value that was expected too, either 0xFF or 0x00
-    TruncatedRecord,
+    TruncatedRecord,                  // TODO: Not a corruption really
 }
 
 #[derive(Debug)]
@@ -45,8 +47,22 @@ pub enum DbError {
     DataBlockExhausted,
     TooManyFilesOpenInProcess,
     TooManyFilesOpenInSystem,
+    NonNumericFileIdOnSstable(PathBuf),
+    InvalidSstableFileName(PathBuf),
+    InvalidMemtableInput(InvalidMemtableInput),
+    OutOfBoundsRead { start: u64, end: u64, len: u64 }, // TODO: extend this to be more elaborate
+}
+#[derive(Debug)]
+pub enum InvalidMemtableInput {
+    KeySizeTooLarge { max: u64, found: u64 },
+    ValueSizeTooLarge { max: u64, found: u64 },
 }
 
+impl From<InvalidMemtableInput> for DbError {
+    fn from(e: InvalidMemtableInput) -> Self {
+        DbError::InvalidMemtableInput(e)
+    }
+}
 impl From<io::Error> for DbError {
     fn from(e: io::Error) -> Self {
         #[cfg(target_os = "macos")]
@@ -181,6 +197,42 @@ impl fmt::Display for DbError {
             }
             Self::TooManyFilesOpenInSystem => {
                 write!(f, "errno: 23. Too many open files in the system.")
+            }
+            Self::NonNumericFileIdOnSstable(p) => {
+                write!(
+                    f,
+                    "Expected SStable to have a valid file id(numeric file stem). File path: {}",
+                    p.display()
+                )
+            }
+            Self::InvalidSstableFileName(p) => {
+                write!(
+                    f,
+                    "Expected SStable to have a valid file name. Found {} instead",
+                    p.display()
+                )
+            }
+            Self::InvalidMemtableInput(e) => match e {
+                InvalidMemtableInput::ValueSizeTooLarge { max, found } => {
+                    write!(
+                        f,
+                        "Value size exceeds maximum value size allowed. Max size: {}. Found size: {}",
+                        max, found
+                    )
+                }
+                InvalidMemtableInput::KeySizeTooLarge { max, found } => {
+                    write!(
+                        f,
+                        "Key size exceeds maximum value size allowed. Max size: {}. Found size: {}",
+                        max, found
+                    )
+                }
+            },
+            Self::OutOfBoundsRead { start, end, len } => {
+                write!(
+                    f,
+                    "tried to read {start}..{end}, but the buffer is {len} bytes"
+                )
             }
         }
     }

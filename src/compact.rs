@@ -673,6 +673,7 @@ impl Eq for MergeItem {}
 /*
 TODOs:
 NOT DONE YET: Handle all errors
+NOD DONE YET(IMPORTANT): We need to ensure that the output files that are created after the merge, dont get prioritized over the other sstables by the timestamp id otherwise we might have older data take precedence over newer data
 NOT DONE YET: Perform compaction using multiple threads, split work into subCompactionJob where each thread works on specific slices of the input files
 NOT DONE YET: need pickFilesForCompaction function(before we do this, we should separate directories into L0, L1, L2, L3 etc)
 NOT DONE YET: needs pickSubSlicesOfFilesForCompaction // picks ranges(of each file) for each thread to work on.
@@ -683,13 +684,4 @@ NOT DONE YET: Extract some duplicate functionality into their own functions
 NOT DONE YET(Important): If we are at the bottom level of ssts, deleted records do not have to be pushed to the final merged_file, instead they are really deleted.
 NOT DONE YET: Compress bytes. check lz4 library for that
 
-NoteS:
-Level 0 are the sstables that are recently flushed from the memtable, as their number grows we compact them up to the next level to make reads faster.
-L0 sstables get compacted with all the L1 sstables to a single L1 sstable
-Each of the other levels, L1, L2, L3, etc., is a single run of an exponentially increasing size: L1 is a run of 10 sstables,
-L2 is a run of 100 sstables, L3 is a run of 1000 sstables, and so on
-When you compact: choose 1 sstable from L^N and all the overlapping sstables from L^(N+1)
-Question: How do we keep track of key overlap ranges between levels? L1 <-> L2 will have some overlap so we have to compact sstables that overlap
-Note: if we are doing a kway merge and we reach MAX_SST_SIZE, then we close the output(meaning we have 1 new complete sstable), then we open a new sst file for the
-remainder of the k way inputs, so this is another sstable that we write to and if its size doesnt make it to MAX_SST_SIZE, thats not an issue.
 */
