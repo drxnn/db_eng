@@ -30,7 +30,7 @@ const MEMTABLE_THRESHOLD: u64 = 8 * 1024 * 1024; // SUBJECT TO CHANGE
 // this means L0 sstables are 8 mb, so we usually compact all L0 sstablse with all L1 sstables to a single L1 sstable.
 const DATA_BLOCK: u16 = 8 * 1024; // Data block in SSTable
 pub const DATA_BLOCK_MAX_BYTES_SIZE: u64 = 155673; // 8192(max db_size) + KEY_MAX_BYTES_SIZE + VALUE_MAX_BYTES_SIZE + 25 bytes for metadata(timestamp, ksz,vsz,tmbstone); // if we had a db_size of 8191, we could end up with adding a max val and max key
-const MAX_BLOCK_SIZE: u64 = 1024 * 1024;
+// const MAX_BLOCK_SIZE: u64 = 1024 * 1024;
 pub const MAX_SST_SIZE: u64 = 1024 * 1024 * 160;
 const TAG_DELETION: u8 = 2;
 const TAG_INSERTION: u8 = 4;
@@ -193,21 +193,20 @@ impl WAL {
     }
 
     // PROBLEM: Right now we sync_all for every single record, make sure you use SyncConfig later on for deciding
-    fn record_to_wal<'a>(&mut self, record: WalRecordType<'a>) -> Result<()> {
+    fn record_to_wal<'a>(&mut self, record: WalRecordType<'a>, timestamp: u64) -> Result<()> {
         let record_buffer = &mut self.record_buffer;
         record_buffer.clear();
-        let tstamp = new_timestamp();
 
         match record {
             WalRecordType::Deletion(k) => {
                 record_buffer.extend_from_slice(&TAG_DELETION.to_le_bytes());
-                record_buffer.extend_from_slice(&tstamp.to_le_bytes());
+                record_buffer.extend_from_slice(&timestamp.to_le_bytes());
                 record_buffer.extend_from_slice(&(k.len() as u64).to_le_bytes());
                 record_buffer.extend_from_slice(k);
             }
             WalRecordType::Insertion(k, v) => {
                 record_buffer.extend_from_slice(&TAG_INSERTION.to_le_bytes());
-                record_buffer.extend_from_slice(&tstamp.to_le_bytes());
+                record_buffer.extend_from_slice(&timestamp.to_le_bytes());
                 record_buffer.extend_from_slice(&(k.len() as u64).to_le_bytes());
                 record_buffer.extend_from_slice(&(v.len() as u64).to_le_bytes());
                 record_buffer.extend_from_slice(k);
@@ -352,14 +351,29 @@ impl SSTable {
         let mut sparse_index_crc = [0u8; 4];
         let mut bloom_filter_crc = [0u8; 4];
         let mut metadata_crc = [0u8; 4];
+        let metadata_crc_in_file = u32::from_le_bytes(metadata_crc);
+        let sparse_index_crc_in_file = u32::from_le_bytes(sparse_index_crc);
+        let bloom_filter_crc_in_file = u32::from_le_bytes(bloom_filter_crc);
 
-        f.seek(SeekFrom::End(-4))?;
+        f.seek(SeekFrom::End(-12))?;
+        f.read_exact(&mut sparse_index_crc)?;
+        f.read_exact(&mut bloom_filter_crc)?;
         f.read_exact(&mut metadata_crc)?;
-        let footer_crc_check = compute_crc_data_block(&footer);
+        let footer_metadata_crc_check = compute_crc_data_block(&footer);
 
-        if footer_crc_check != u32::from_le_bytes(metadata_crc) {
-            // ERROR, cant trust offsets
+        if footer_metadata_crc_check != metadata_crc_in_file {
+            // ERROR, throw error or rebuild HERE?
+            // throw error, have caller call the rebuild function
             // can rebuild the entire metadata in that case
+            // Caller calls rebuild function from this err
+            return Err(DbError::DataCorrupted(DataCorruptedErr {
+                offset: f.stream_position()?,
+                file_path: path.to_path_buf(),
+                reason: CorruptionType::CrcMismatch {
+                    expected: footer_metadata_crc_check,
+                    found: metadata_crc_in_file,
+                },
+            }));
         }
 
         let file_length = f.metadata()?.len();
@@ -392,6 +406,8 @@ impl SSTable {
                 })
             })?;
 
+        // check_key_value_record_does_not_exceed_max(size, max_size, offset, file_path)
+        // TODO: have the helper function above work with different kinds of data_corruption // not just k/v record check
         if full_data_length > file_length {
             return Err(DbError::DataCorrupted(DataCorruptedErr {
                 offset: sparse_index_offset,
@@ -416,12 +432,30 @@ impl SSTable {
 
         // let sparse_index: &[u8] = &full_sst_data[0..(size_of_sparse_index as usize)];
         let sparse_index: &[u8] = read_range(&full_sst_data, 0, size_of_sparse_index as usize)?;
+        let sparse_index_crc_check = compute_crc_data_block(sparse_index);
+
+        if sparse_index_crc_in_file != sparse_index_crc_check {
+            return Err(DbError::DataCorrupted(DataCorruptedErr {
+                offset: sparse_index_offset,
+                file_path: path.to_path_buf(),
+                reason: CorruptionType::CrcMismatch {
+                    expected: sparse_index_crc_check,
+                    found: sparse_index_crc_in_file,
+                },
+            }));
+        }
+
         let bloom_filter: &[u8] = read_range(
             &full_sst_data,
             bloom_filter_start as usize,
             bloom_filter_end as usize as usize,
         )?;
-        // let bloom_filter =
+
+        let bloom_filter_crc_check = compute_crc_data_block(bloom_filter);
+        if bloom_filter_crc_check != bloom_filter_crc_in_file {
+            // handle
+            // also TODO: have the errors specify which crc failed: data_block | metadata | sparse_index etc
+        }
         // &full_sst_data[(bloom_filter_start as usize)..(bloom_filter_end as usize)];
         let min_key = read_range(
             &full_sst_data,
@@ -1149,7 +1183,7 @@ impl FlushingManager {
                         pos = reader.stream_position()?;
 
                         memtable.put(&key_buffer, &val_buffer, u64::from_le_bytes(tstamp)); // PROBLEM: This out call will overwrite the actual timestamp of records
-                        // easy fix: just pass timestmap to put?
+
                         // TAG_INSERTION handle tstamp | ksz | vsz | key | value |crc (4 bytes)
                     }
                     _ => {
@@ -1316,13 +1350,13 @@ impl KVEngine {
             return Ok(Absent);
         };
 
-        if data_len > MAX_BLOCK_SIZE {
+        if data_len > DATA_BLOCK_MAX_BYTES_SIZE {
             return Err(DbError::DataCorrupted(DataCorruptedErr {
                 offset,
                 file_path: sstable.file_path.clone(),
                 reason: CorruptionType::BufferExceedsMaxLength {
                     size: data_len,
-                    max_size: MAX_BLOCK_SIZE,
+                    max_size: DATA_BLOCK_MAX_BYTES_SIZE,
                 },
             }));
         }
@@ -1481,10 +1515,11 @@ impl KVEngine {
         {
             self.rotate_memtable_and_wal()?;
         }
+        let tstamp = new_timestamp();
         self.wal
-            .record_to_wal(WalRecordType::Insertion(key, value))?;
+            .record_to_wal(WalRecordType::Insertion(key, value), tstamp)?;
 
-        self.memtable.put(key, value, new_timestamp());
+        self.memtable.put(key, value, tstamp);
 
         Ok(())
     }
@@ -1495,8 +1530,10 @@ impl KVEngine {
         if (k_len + self.memtable.size_in_bytes) > self.memtable.threshold {
             self.rotate_memtable_and_wal()?;
         }
-        self.wal.record_to_wal(WalRecordType::Deletion(key))?;
-        self.memtable.delete(key, new_timestamp());
+        let tstamp = new_timestamp();
+        self.wal
+            .record_to_wal(WalRecordType::Deletion(key), tstamp)?;
+        self.memtable.delete(key, tstamp);
 
         Ok(())
     }
