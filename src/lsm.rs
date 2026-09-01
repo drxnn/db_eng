@@ -10,16 +10,14 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, RwLock};
 use std::sync::{Weak, mpsc};
 use std::thread::spawn;
-use std::{todo, unimplemented};
+use std::todo;
 
 use crate::errors::CorruptionType::Other;
 
-use crate::errors::{
-    self, CorruptionType, DataCorruptedErr, DbError, InvalidMemtableInput, Result,
-};
+use crate::errors::{CorruptionType, DataCorruptedErr, DbError, InvalidMemtableInput, Result};
 use crate::helpers::{
-    NUM_HASHES, check_key_value_record_does_not_exceed_max, compute_crc, compute_crc_data_block,
-    create_new_data_file, get_hashed_key_positions, new_timestamp, read_range,
+    NUM_HASHES, compute_crc_data_block, create_new_data_file, get_hashed_key_positions,
+    new_timestamp, read_range,
 };
 use crate::lsm::Lookup::{Absent, Deleted, Found};
 
@@ -323,10 +321,6 @@ pub struct SSTable {
 
 impl SSTable {
     pub fn load(path: &Path) -> Result<Self> {
-        // open reader of file
-        // start reading backwards and return the metadata in a SST
-        //// footer is :
-        // sparse_index | bloom_filter | min key | max key | sizeof(sparse_index) | sparse_index_offset| sizeof(bloom_filter) | bloom filter_offset | sizeof(minkey) | minkey offset | sizeof(maxkey) | maxkey offset | 64 bytes(not including min and max key)
         //TODO: check footers checksum(doesnt have it yet)
         // TOOD: start by reading the crc of the metadata, if its good, then check the bloom_filter, if the crc is good, load it(if not skip it)
         // then check sparse_index_crc, if its good, load it, if not rebuild it
@@ -344,21 +338,23 @@ impl SSTable {
             .ok()
             .ok_or_else(|| DbError::InvalidSstableFileName(path.to_path_buf()))?; // Have the caller skip file if this happens
 
-        f.seek(SeekFrom::End(-40))?;
+        f.seek(SeekFrom::End(-56))?;
         let mut footer = [0u8; 40];
         f.read_exact(&mut footer)?;
 
         let mut sparse_index_crc = [0u8; 4];
         let mut bloom_filter_crc = [0u8; 4];
         let mut metadata_crc = [0u8; 4];
+        let mut min_max_crc = [0u8; 4];
+
+        f.read_exact(&mut sparse_index_crc)?;
+        f.read_exact(&mut bloom_filter_crc)?;
+        f.read_exact(&mut min_max_crc)?;
+        f.read_exact(&mut metadata_crc)?;
+        let min_max_crc_in_file = u32::from_le_bytes(min_max_crc);
         let metadata_crc_in_file = u32::from_le_bytes(metadata_crc);
         let sparse_index_crc_in_file = u32::from_le_bytes(sparse_index_crc);
         let bloom_filter_crc_in_file = u32::from_le_bytes(bloom_filter_crc);
-
-        f.seek(SeekFrom::End(-12))?;
-        f.read_exact(&mut sparse_index_crc)?;
-        f.read_exact(&mut bloom_filter_crc)?;
-        f.read_exact(&mut metadata_crc)?;
         let footer_metadata_crc_check = compute_crc_data_block(&footer);
 
         if footer_metadata_crc_check != metadata_crc_in_file {
@@ -465,6 +461,17 @@ impl SSTable {
         // let min_key = &full_sst_data[(min_k_start as usize)..(min_k_end as usize)];
         // let max_k = &full_sst_data[(max_k_start as usize)..(max_k_end as usize)];
         let max_k = read_range(&full_sst_data, max_k_start as usize, max_k_end as usize)?;
+
+        let min_max_key_crc_to_check = compute_crc_data_block(read_range(
+            &full_sst_data,
+            min_k_start as usize,
+            max_k_end as usize,
+        )?);
+
+        if min_max_key_crc_to_check != min_max_crc_in_file {
+            // TODO: Decide what to do here, you can probably either rebuild the entire footer
+            // or if the sparse_index is good, that information might be good enough for fast lookups
+        }
 
         // SAFE unless data is corrupted
         // if
@@ -969,7 +976,8 @@ impl AVL {
 
             // before we write here: we need to get a CRC for the sparse_index and the bloom_filter
 
-            let footer_crc = compute_crc_data_block(&footer);
+            let footer_crc = compute_crc_data_block(&footer[footer.len() - 40..]);
+            let min_max_crc = compute_crc_data_block(&footer[..footer.len() - 40]);
             let sparse_crc = compute_crc_data_block(&sparse_index.index_entries);
 
             writer.write_all(&sparse_index.index_entries)?;
@@ -986,6 +994,7 @@ impl AVL {
             writer.write_all(&footer)?;
             writer.write_all(&sparse_crc.to_le_bytes())?;
             writer.write_all(&bloom_crc.to_le_bytes())?;
+            writer.write_all(&min_max_crc.to_le_bytes())?;
             writer.write_all(&footer_crc.to_le_bytes())?;
 
             let f = writer.into_inner().map_err(|e| {
@@ -1202,7 +1211,9 @@ impl FlushingManager {
 
         match outcome {
             Ok(()) => {}
-            Err(e) => {}
+            Err(e) => {
+                //
+            }
         }
         Ok(())
     }
@@ -1217,6 +1228,7 @@ impl FlushingManager {
                     // always should have parent
                     File::open(dir)?.sync_all()?;
                 }
+                let _ = fs::remove_file(path); // wal data has been put into sst, remove wal
                 (f, tmp_file, ss_final_path)
             }
             Err(DbError::SyncFail(err, path)) => {
@@ -1561,7 +1573,7 @@ impl KVEngine {
 }
 
 /*Notes:
- // footer is : sparse_index | bloom_filter | min key | max key |  sparse_index_offset| sizeof(sparse_index) | sizeof(bloom_filter) | sizeof(minkey) | sizeof(maxkey) | sparse_crc(4 bytes) | bloom_crc(4 bytes) | metadata_crc(4 bytes) |
+ // footer is : sparse_index | bloom_filter | min key | max key |  sparse_index_offset| sizeof(sparse_index) | sizeof(bloom_filter) | sizeof(minkey) | sizeof(maxkey) | sparse_crc(4 bytes) | bloom_crc(4 bytes) | min_max_key_crc | metadata_crc(4 bytes) |
  //TODO: need a CRC for the metadata
 DataBlocks:  [ tstamp(8) | ksz(8) | value_sz(8) | key | value  tstamp(8) | ksz(8) | value_sz(8) | key | value ... crc(4)]
 SSTable: Datablock1 | DataBlock2 ... Datablock N | Footer
@@ -1587,7 +1599,9 @@ Bloom filter: k-hash bit array per SSTable to skip files on negative lookups. Us
 
  TODO(IMPORTANT): Add crc to the footer metadata as well
  // ALSO TODO(done): Make sure everything gets serialized as u64 and dont use usize
- //TODO: have a crc for bloom_filter, sparse_index, and the metadata.
+// TODO: Decide what to do when other footer metadata is corrupted other than sparse_index
+// sparse_index definitely needs to be rebuilt if thats the case, what about bloom filter, minmax keys?
+// TODO: WRITE TESTS
  //
 
 */

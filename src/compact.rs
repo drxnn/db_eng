@@ -10,13 +10,15 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread::spawn;
 
+use std::mem;
 use std::{
     fs::File,
     io::{BufReader, BufWriter, Read},
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
 };
-use std::{mem, todo};
+
+use crc::{CRC_32_ISO_HDLC, Crc};
 
 use crate::errors::CompactionErr::{self, HeapNotFound};
 use crate::errors::CorruptionType::{self, TruncatedRecord};
@@ -258,7 +260,7 @@ impl CompactionFileElement {
                 0x00 => false,
                 _ => {
                     return Err(DbError::DataCorrupted(DataCorruptedErr {
-                        offset: self.curr_offset_from_file - 1, // should point to the byte where tombstone begins
+                        offset: self.curr_offset_from_file - 1, //  point to the byte where tombstone begins
                         file_path: self.sst_slice.file_path.clone(),
                         reason: crate::errors::CorruptionType::TombstoneCorrupted {
                             found: tmbstone[0],
@@ -335,7 +337,7 @@ impl CompactionFileElement {
         // have the caller account for this error
         if crc_to_check != crc_from_buff {
             return Err(DbError::DataCorrupted(DataCorruptedErr {
-                offset: offset + data_len,
+                offset,
                 file_path: self.sst_slice.file_path.to_path_buf(),
                 reason: CorruptionType::CrcMismatch {
                     expected: crc_to_check,
@@ -539,14 +541,26 @@ impl CompactionManager {
             sst_finalizer.sparse_index.index_entries.len() as u64,
             (bloom_filter.bits.len() * 8) as u64,
         );
+        let footer_crc = compute_crc_data_block(&footer[footer.len() - 40..]);
+        let min_max_crc = compute_crc_data_block(&footer[..footer.len() - 40]);
+        let sparse_crc = compute_crc_data_block(&sst_finalizer.sparse_index.index_entries);
 
         sst_finalizer
             .writer
             .write_all(&sst_finalizer.sparse_index.index_entries)?;
+
+        let crc32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+        let mut bloom_digest = crc32.digest();
         for word in &bloom_filter.bits {
+            bloom_digest.update(&word.to_le_bytes());
             sst_finalizer.writer.write_all(&word.to_le_bytes())?;
         }
+        let bloom_crc = bloom_digest.finalize();
         sst_finalizer.writer.write_all(&footer)?;
+        sst_finalizer.writer.write_all(&sparse_crc.to_le_bytes())?;
+        sst_finalizer.writer.write_all(&bloom_crc.to_le_bytes())?;
+        sst_finalizer.writer.write_all(&min_max_crc.to_le_bytes())?;
+        sst_finalizer.writer.write_all(&footer_crc.to_le_bytes())?;
 
         sst_finalizer.writer.flush()?;
         sst_finalizer.writer.get_mut().sync_all()?;
