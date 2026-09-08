@@ -1,4 +1,7 @@
-use crate::errors::Result;
+use crate::{
+    errors::{CorruptionType::TruncatedRecord, Result},
+    lsm::Hlc,
+};
 use crc::{CRC_32_ISO_HDLC, Crc};
 use xxhash_rust::xxh3::xxh3_128;
 pub const NUM_HASHES: usize = 7;
@@ -31,18 +34,29 @@ pub fn compute_crc_data_block(data: &[u8]) -> u32 {
 use std::io::Error;
 use std::{
     fs::{File, OpenOptions},
-    io,
+    io::{self, ErrorKind::UnexpectedEof, Read},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::errors::{DataCorruptedErr, DbError};
 
 pub fn new_timestamp() -> u64 {
+    // TODO: use an Atomics<u64>
+    // Actually keep timestamp just add a logical counter for ordering of events modelled after HLC
+    //
+
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_nanos() as u64
+        .as_micros() as u64
+    // use 52 of the bits of the value above to be the timestamp
+    // then 12 of the bits serve as a logical counter so we get 2^12
+    //[timestampbits52...logicalcounterbits12]
 }
 
 // PROBLEM: Not cache friendly
@@ -67,6 +81,7 @@ pub fn get_positions_from_hashed_key(
     hashed_key: u128,
     bloom_filter_size: usize,
 ) -> [usize; NUM_HASHES] {
+    // TODO: make sure bloom_filter is never 0, or just throw err
     let h1 = (hashed_key >> 64) as u64;
     let h2 = hashed_key as u64;
 
@@ -78,6 +93,25 @@ pub fn get_positions_from_hashed_key(
     arr
 }
 
+pub fn read_exact_or_corrupt(
+    reader: &mut impl Read,
+    buf: &mut [u8],
+    offset: u64,
+    file_path: &Path,
+) -> Result<()> {
+    // if we get a truncated record, we have corrupted data
+    reader.read_exact(buf).map_err(|e| {
+        if e.kind() == UnexpectedEof {
+            DbError::DataCorrupted(DataCorruptedErr {
+                offset,
+                file_path: file_path.to_path_buf(),
+                reason: TruncatedRecord,
+            })
+        } else {
+            DbError::Io(e)
+        }
+    })
+}
 // helper for key and value record check only
 pub fn check_key_value_record_does_not_exceed_max(
     size: u64,
@@ -99,10 +133,12 @@ pub fn check_key_value_record_does_not_exceed_max(
     }
 }
 
-pub fn create_new_data_file(dir: &Path) -> io::Result<(File, PathBuf, PathBuf)> {
-    let tstamp = new_timestamp();
-    let data_file_path_final = dir.join(format!("{}.sst", tstamp));
-    let data_file_path_tmp = dir.join(format!("{}.sst.tmp", tstamp));
+pub fn create_new_data_file(dir: &Path, hlc: &Hlc) -> io::Result<(File, PathBuf, PathBuf)> {
+    // let tstamp = new_timestamp();
+
+    let ts = hlc.update_and_return_hlc();
+    let data_file_path_final = dir.join(format!("{}.sst", ts));
+    let data_file_path_tmp = dir.join(format!("{}.sst.tmp", ts));
     let data_file = OpenOptions::new()
         .read(true)
         .append(true)

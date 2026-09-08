@@ -16,18 +16,52 @@ pub struct DataCorruptedErr {
     pub file_path: PathBuf,
     pub reason: CorruptionType,
 }
+#[derive(Debug)]
+pub enum CrcMismatchType {
+    // can add more as needed
+    MinMaxFooterKeys,
+    BloomFilter,
+    SparseIndex,
+    DataBlock,
+    WalRecord,
+    SstFooterMetadata,
+}
 
 #[derive(Debug)]
+
 pub enum CorruptionType {
-    CrcMismatch { expected: u32, found: u32 },
+    CrcMismatch {
+        expected: u32,
+        found: u32,
+        mismatch_type: CrcMismatchType,
+    },
     Other(String),
-    LengthMismatch { expected: usize, found: usize },
-    BufferExceedsMaxLength { size: u64, max_size: u64 },
-    MetadataSizeOverflow { sizes: [u64; 4] },
-    MetaDataSizeExceedsFileSize { file_size: u64, metadata_size: u64 },
-    KeyValueRecordExceedsMaxLength { max: u64, found: u64 },
-    TombstoneCorrupted { found: u8 }, // add value that was expected too, either 0xFF or 0x00
-    TruncatedRecord,                  // TODO: Not a corruption really
+    LengthMismatch {
+        expected: usize,
+        found: usize,
+    },
+    BufferExceedsMaxLength {
+        size: u64,
+        max_size: u64,
+    },
+    MetadataSizeOverflow {
+        sizes: [u64; 4],
+    },
+    MetaDataSizeExceedsFileSize {
+        file_size: u64,
+        metadata_size: u64,
+    },
+    KeyValueRecordExceedsMaxLength {
+        max: u64,
+        found: u64,
+    },
+    RecordTypeCorrupted {
+        found: u8,
+    },
+    TombstoneCorrupted {
+        found: u8,
+    }, // add value that was expected too, either 0xFF or 0x00
+    TruncatedRecord, // TODO: Not a corruption necessarily
 }
 
 #[derive(Debug)]
@@ -97,8 +131,16 @@ pub enum FlushingError {
 impl fmt::Display for CorruptionType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::CrcMismatch { expected, found } => {
-                write!(f, "Expected crc: {}. Found crc: {}", expected, found)
+            Self::CrcMismatch {
+                expected,
+                found,
+                mismatch_type,
+            } => {
+                write!(
+                    f,
+                    "CrcTypeFails: {:?}. Expected crc: {}. Found crc: {}",
+                    mismatch_type, expected, found
+                )
             }
             Self::Other(str) => {
                 write!(f, "{}", str)
@@ -138,6 +180,9 @@ impl fmt::Display for CorruptionType {
             }
             Self::TruncatedRecord => {
                 write!(f, "Trucated Record Found")
+            }
+            Self::RecordTypeCorrupted { found } => {
+                write!(f, "Corrupted RecordType byte. Instead found: {}", found)
             }
         }
     }

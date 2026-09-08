@@ -6,22 +6,26 @@ use std::fs::{self, File, OpenOptions, remove_file};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, RwLock};
 use std::sync::{Weak, mpsc};
 use std::thread::spawn;
 use std::todo;
 
-use crate::errors::CorruptionType::Other;
+use crate::errors::CorruptionType::{Other, TruncatedRecord};
 
-use crate::errors::{CorruptionType, DataCorruptedErr, DbError, InvalidMemtableInput, Result};
+use crate::errors::{
+    CorruptionType, CrcMismatchType, DataCorruptedErr, DbError, InvalidMemtableInput, Result,
+};
 use crate::helpers::{
     NUM_HASHES, compute_crc_data_block, create_new_data_file, get_hashed_key_positions,
-    new_timestamp, read_range,
+    new_timestamp, read_exact_or_corrupt, read_range,
 };
 use crate::lsm::Lookup::{Absent, Deleted, Found};
 
-use std::cmp::{Ordering, Reverse, max};
+use std::cmp::{Ordering as CmpOrdering, Reverse, max};
 
 // const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024; // SUBJECT TO CHANGE
 const MEMTABLE_THRESHOLD: u64 = 8 * 1024 * 1024; // SUBJECT TO CHANGE
@@ -34,6 +38,10 @@ const TAG_DELETION: u8 = 2;
 const TAG_INSERTION: u8 = 4;
 pub const KEY_MAX_BYTES_SIZE: u64 = 16384;
 pub const VALUE_MAX_BYTES_SIZE: u64 = 131072;
+pub const NUM_OF_BITS_FOR_TSTAMP: u8 = 52;
+pub const NUM_OF_BITS_FOR_COUNTER: u8 = 12;
+pub const MASK_FOR_COUNTER: u64 = (u64::MAX) >> NUM_OF_BITS_FOR_TSTAMP; // 4096
+pub const MASK_FOR_TSTAMP: u64 = (u64::MAX) << NUM_OF_BITS_FOR_COUNTER;
 
 // WAL config for flush
 
@@ -86,35 +94,49 @@ impl SparseIndex {
         self.size += 1;
     }
 
-    fn parse_sparse_index(b: &[u8]) -> Result<Vec<(Vec<u8>, u64, u64)>> {
-        // TODO: Match on result in call sites since we change signature
+    fn parse_sparse_index(b: &[u8], path: PathBuf) -> Result<Vec<(Vec<u8>, u64, u64)>> {
         let mut out = Vec::new();
         // I am parsing this layout: ksz(8) | key(of size: ksz) | offset(8) | datablock_sz(8)
         // to essentially => key | offset | datablock_sz (this lives in memory, the sparseIndex needs key to binary search. meanwhile the sparseIndex in the metadatafooter does need the key size)
-        // TODO: Ensure this is safe, data could be corrupted
+        // TODO:
         // Have caller
         let mut current = 0;
         while current < b.len() {
             // let ksz = u64::from_le_bytes(b[current..(current + 8)].try_into().unwrap());
             // put in a function and reuse
             let ksz = u64::from_le_bytes(read_range(b, current, current + 8)?.try_into().unwrap());
-            // if ksz > KEY_MAX_BYTES_SIZE || ksz > (b.len() as u64 - current as u64) {
-            //     // err
-            // }
+            if ksz > KEY_MAX_BYTES_SIZE {
+                return Err(DbError::DataCorrupted(DataCorruptedErr {
+                    offset: current as u64,
+                    file_path: path,
+                    reason: CorruptionType::KeyValueRecordExceedsMaxLength {
+                        max: KEY_MAX_BYTES_SIZE,
+                        found: ksz,
+                    },
+                }));
+            }
             current += 8;
             let key = read_range(b, current, current + (ksz as usize))?.to_vec();
 
-            // let key = b[current..(current + (ksz as usize))].to_vec();
             current += ksz as usize;
 
-            // let offset = u64::from_le_bytes(b[current..(current + 8)].try_into().unwrap());
             let offset =
                 u64::from_le_bytes(read_range(b, current, current + 8)?.try_into().unwrap());
 
             current += 8;
-            // let data_block_size = u64::from_le_bytes(b[current..(current + 8)].try_into().unwrap());
+
             let data_block_size =
                 u64::from_le_bytes(read_range(b, current, current + 8)?.try_into().unwrap());
+            if data_block_size > DATA_BLOCK_MAX_BYTES_SIZE {
+                return Err(DbError::DataCorrupted(DataCorruptedErr {
+                    offset: current as u64,
+                    file_path: path,
+                    reason: CorruptionType::BufferExceedsMaxLength {
+                        size: data_block_size,
+                        max_size: DATA_BLOCK_MAX_BYTES_SIZE,
+                    },
+                }));
+            }
             current += 8;
             out.push((key, offset, data_block_size));
         }
@@ -166,9 +188,15 @@ struct WAL {
 }
 
 impl WAL {
-    fn new(threshold: u64, sync_c: SyncConfig, parent_dir: &PathBuf) -> io::Result<WAL> {
-        let tstamp = new_timestamp();
-        let wal_path = parent_dir.join(format!("{}.wal", tstamp));
+    fn new(
+        threshold: u64,
+        sync_c: SyncConfig,
+        parent_dir: &PathBuf,
+        curr_hlc: u64,
+    ) -> io::Result<WAL> {
+        // let tstamp = new_timestamp();
+
+        let wal_path = parent_dir.join(format!("{}.wal", curr_hlc));
 
         //
         let wal_file = OpenOptions::new()
@@ -312,21 +340,14 @@ pub struct SSTable {
     file: File,
     file_path: PathBuf,
     file_size: u64,
-    min_key: Vec<u8>,
-    max_key: Vec<u8>,
+    min_max_keys: Option<(Vec<u8>, Vec<u8>)>, // min_key is index 0, max_key is index 1
     sparse_index: Arc<Vec<(Vec<u8>, u64, u64)>>, // key | offset | datablock block length ( before CRC, which means you need to read the next 4 bytes and compute the crc)
-    bloom_filter: BloomFilter,
+    bloom_filter: Option<BloomFilter>,
     corrupted: bool,
 }
 
 impl SSTable {
     pub fn load(path: &Path) -> Result<Self> {
-        //TODO: check footers checksum(doesnt have it yet)
-        // TOOD: start by reading the crc of the metadata, if its good, then check the bloom_filter, if the crc is good, load it(if not skip it)
-        // then check sparse_index_crc, if its good, load it, if not rebuild it
-        // this means we should make bloom_filter an option, if its corrupted set to None
-
-        // maybe have the function return Result<Option>> in case of data corruption, dont build ss, or throw err and have caller check why ss couldnt be built
         let mut f = File::open(path)?;
         let stem = path
             .file_stem()
@@ -358,16 +379,13 @@ impl SSTable {
         let footer_metadata_crc_check = compute_crc_data_block(&footer);
 
         if footer_metadata_crc_check != metadata_crc_in_file {
-            // ERROR, throw error or rebuild HERE?
-            // throw error, have caller call the rebuild function
-            // can rebuild the entire metadata in that case
-            // Caller calls rebuild function from this err
             return Err(DbError::DataCorrupted(DataCorruptedErr {
                 offset: f.stream_position()?,
                 file_path: path.to_path_buf(),
                 reason: CorruptionType::CrcMismatch {
                     expected: footer_metadata_crc_check,
                     found: metadata_crc_in_file,
+                    mismatch_type: CrcMismatchType::SstFooterMetadata,
                 },
             }));
         }
@@ -437,6 +455,7 @@ impl SSTable {
                 reason: CorruptionType::CrcMismatch {
                     expected: sparse_index_crc_check,
                     found: sparse_index_crc_in_file,
+                    mismatch_type: CrcMismatchType::SparseIndex,
                 },
             }));
         }
@@ -448,10 +467,7 @@ impl SSTable {
         )?;
 
         let bloom_filter_crc_check = compute_crc_data_block(bloom_filter);
-        if bloom_filter_crc_check != bloom_filter_crc_in_file {
-            // handle
-            // also TODO: have the errors specify which crc failed: data_block | metadata | sparse_index etc
-        }
+
         // &full_sst_data[(bloom_filter_start as usize)..(bloom_filter_end as usize)];
         let min_key = read_range(
             &full_sst_data,
@@ -468,37 +484,45 @@ impl SSTable {
             max_k_end as usize,
         )?);
 
-        if min_max_key_crc_to_check != min_max_crc_in_file {
-            // TODO: Decide what to do here, you can probably either rebuild the entire footer
-            // or if the sparse_index is good, that information might be good enough for fast lookups
-        }
-
-        // SAFE unless data is corrupted
-        // if
-        let bloomf_filter_64 = bloom_filter
+        let bloomf_filter_64: Vec<u64> = bloom_filter
             .chunks_exact(8)
             .map(|chunk| {
                 u64::from_le_bytes(
                     chunk
                         .try_into()
-                        .expect("bloom_filter not divided in 64 bit chunks, data corrupted"), // dont expect
+                        .expect("bloom_filter not divided in 64 bit chunks, data corrupted"),
                 )
             })
             .collect();
 
-        let parsed_sparse_index = SparseIndex::parse_sparse_index(sparse_index)?; // catch err from caller
+        let num_bits = (bloomf_filter_64.len() * 64) as u64;
+
+        // IF THE BLOOM_FILTER BITS ARE CORRUPTED, WE JUST DON'T USE IT. NO ERR
+        let bloom_filter = if bloom_filter_crc_check == bloom_filter_crc_in_file {
+            Some(BloomFilter {
+                bits: bloomf_filter_64,
+                num_bits,
+            })
+        } else {
+            None
+        };
+
+        let min_max = if min_max_key_crc_to_check == min_max_crc_in_file {
+            Some((min_key.to_vec(), max_k.to_vec()))
+        } else {
+            None
+        };
+
+        let parsed_sparse_index =
+            SparseIndex::parse_sparse_index(sparse_index, path.to_path_buf())?; // catch err from caller
         Ok(SSTable {
             id,
             file: f,
             file_path: path.to_path_buf(),
             file_size: file_length,
-            min_key: min_key.to_vec(),
-            max_key: max_k.to_vec(),
+            min_max_keys: min_max,
             sparse_index: Arc::new(parsed_sparse_index),
-            bloom_filter: BloomFilter {
-                bits: bloomf_filter_64,
-                num_bits: (size_of_bloom_filter * 8),
-            },
+            bloom_filter,
             corrupted: false,
         })
     }
@@ -857,7 +881,6 @@ impl AVL {
         sizeof_si: u64,
         sizeof_bf: u64,
     ) -> Vec<u8> {
-        // TODO! SHOULD HAVE A CRC FOR METADATA
         let mut footer: Vec<u8> = Vec::new();
 
         footer.extend_from_slice(min_key);
@@ -916,7 +939,7 @@ impl AVL {
         Ok(())
     }
 
-    fn sync_avl(&self, dir: &Path) -> Result<Option<(File, PathBuf, PathBuf)>> {
+    fn sync_avl(&self, dir: &Path, hlc: &Hlc) -> Result<Option<(File, PathBuf, PathBuf)>> {
         let min_k = match Self::get_min_node(&self.root) {
             Some(k) => k,
             None => return Ok(None),
@@ -926,11 +949,10 @@ impl AVL {
             Some(k) => k,
             None => return Ok(None),
         };
-        let (file, ss_path_tmp, ss_path_final) = create_new_data_file(dir)?;
+
+        let (file, ss_path_tmp, ss_path_final) = create_new_data_file(dir, hlc)?;
         let tmp_path_for_err_case = ss_path_tmp.clone();
 
-        // ALSO TODO: Anticipate errors, clean up the files if we err
-        // return DbErr(SyncFail(DbErr, path)) explicitly
         // TODO LATER: Have a Manifest file that just keeps track of what files are active and if a file isnt in the Manifest it gets deleted.
         (|| -> Result<Option<(File, PathBuf, PathBuf)>> {
             // TODO: Can also put in a function
@@ -943,8 +965,6 @@ impl AVL {
             // sizeof(key) | key | offset | datablock block length ( before CRC )
             let mut sparse_index = SparseIndex::new();
             let mut bloom_filter = BloomFilter::new(self.size as usize * 10);
-            //TODO: If there is no min k or max k, that means the AVL is empty. Not an error, should return None.
-            // None means there is nothing to sync and we just skip
 
             let mut file_offset: u64 = 0;
             self.build_sstable_recursive(
@@ -1022,6 +1042,18 @@ struct FlushingManager {
     rx: Receiver<FlushingThreadResponse>,
 }
 
+pub enum WalReplayState {
+    Clean,                   // replayed everything to mem
+    PartialTruncated,        // field is offset where we stopped // JUST DELETE FILE HERE
+    PartialCorrupt(DbError), // offset, err // HERE YOU TELL THE CALLER THAT FILE IS CORRUPT
+}
+pub struct WalToMemtableReplay {
+    memtable: AVL,
+    records_recovered: u64,
+    valid_bytes: u64,
+    replay_state: WalReplayState,
+}
+
 impl FlushingManager {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel::<FlushingThreadResponse>();
@@ -1029,11 +1061,16 @@ impl FlushingManager {
     }
 
     // main will poll and on success, will add the SST to active memory and delete old_wal from directory
-    fn background_flush_memtable(&mut self, frozen: Arc<AVL>, dir: PathBuf) -> Result<()> {
+    fn background_flush_memtable(
+        &mut self,
+        frozen: Arc<AVL>,
+        dir: PathBuf,
+        hlc: Arc<Hlc>,
+    ) -> Result<()> {
         let tx: Sender<FlushingThreadResponse> = self.tx.clone();
 
         spawn(move || -> Result<()> {
-            let (f, ss_path_final) = match frozen.sync_avl(&dir) {
+            let (f, ss_path_final) = match frozen.sync_avl(&dir, &hlc) {
                 Ok(Some((f, _, ss_path_final))) => {
                     if let Some(dir) = ss_path_final.parent() {
                         // always should have parent
@@ -1062,10 +1099,26 @@ impl FlushingManager {
             };
 
             let sstable = SSTable::load(&ss_path_final);
+            // TODO HERE: now that I am returning an error on the crc check fail, we need to rebuild the SStable in the case of
+            // the spars index being corrupted, use crcmismatch type
+            // if other err like: NonNumericFileIdOnSstable just send the error to main
             match sstable {
                 Ok(sst) => {
-                    let _ = tx.send(FlushingThreadResponse::Success(sst)); // when main receives this, DESTRUCT OLD WAL
+                    let _ = tx.send(FlushingThreadResponse::Success(sst));
                 }
+                Err(DbError::DataCorrupted(DataCorruptedErr {
+                    reason:
+                        CorruptionType::CrcMismatch {
+                            mismatch_type: CrcMismatchType::SparseIndex,
+                            ..
+                        }
+                        | CorruptionType::MetaDataSizeExceedsFileSize { .. }
+                        | CorruptionType::MetadataSizeOverflow { .. },
+                    ..
+                })) => {
+                    //TODO READ COMMENT ON LINE 1357(WHERE WE CALL SSTable::load on KVE::open())
+                }
+                // SHOULD NOT GET ANY OF THE CRCMISMATCH ERRORS OR FAILURES HERE SINCE WE JUST SYNCED THIS TO FILE CORRECTLY
                 Err(dberr) => {
                     let _ = tx.send(FlushingThreadResponse::Error(dberr));
                     return Err(DbError::ReportedViaChannel);
@@ -1078,7 +1131,11 @@ impl FlushingManager {
         Ok(())
     }
 
-    fn build_avl_from_wal(&mut self, memtable: &mut AVL, path: &PathBuf) -> Result<()> {
+    fn build_avl_from_wal(&self, path: &PathBuf) -> Result<WalToMemtableReplay> {
+        let mut memtable = AVL::new(MEMTABLE_THRESHOLD);
+        let mut curr_offset: u64 = 0;
+        let mut records_recovered = 0;
+
         let wal_f = File::open(path)?;
 
         let file_len = wal_f.metadata()?.len();
@@ -1086,6 +1143,7 @@ impl FlushingManager {
         let mut reader = BufReader::new(&wal_f);
 
         let mut type_of_record: [u8; 1] = [0u8; 1];
+        let mut valid_bytes: u64 = 0;
         let mut ksz = [0u8; 8];
         let mut tstamp = [0u8; 8];
         let mut vsz = [0u8; 8];
@@ -1094,18 +1152,21 @@ impl FlushingManager {
         let outcome = (|| -> Result<()> {
             while pos < file_len {
                 // We should read records up until a truncated record or a corrupted record, then we stop
-                reader.read_exact(&mut type_of_record)?; // 1 byte
+                read_exact_or_corrupt(&mut reader, &mut type_of_record, curr_offset, path)?;
+                curr_offset += 1;
                 let type_tag = type_of_record[0];
 
                 match type_tag {
                     TAG_DELETION => {
                         //  TAG_DELETION handle  [ tstamp(8) | ksz(8) | key(sizeof ksz ) |crc (4 bytes) ]
-                        reader.read_exact(&mut tstamp)?;
-                        reader.read_exact(&mut ksz)?;
+                        read_exact_or_corrupt(&mut reader, &mut tstamp, curr_offset, path)?;
+                        curr_offset += 8;
+                        read_exact_or_corrupt(&mut reader, &mut ksz, curr_offset, path)?;
+                        curr_offset += 8;
 
                         let key_size = u64::from_le_bytes(ksz);
 
-                        if key_size > KEY_MAX_BYTES_SIZE || pos + key_size + 21 > file_len {
+                        if key_size > KEY_MAX_BYTES_SIZE {
                             return Err(DbError::DataCorrupted(DataCorruptedErr {
                                 offset: pos,
                                 file_path: path.to_path_buf(),
@@ -1116,13 +1177,15 @@ impl FlushingManager {
                         }
                         let mut key_buffer = vec![0u8; key_size as usize];
 
-                        reader.read_exact(&mut key_buffer)?;
+                        read_exact_or_corrupt(&mut reader, &mut key_buffer, curr_offset, path)?;
+                        curr_offset += key_size;
 
                         let crc_data_block =
                             [type_of_record.as_slice(), &tstamp, &ksz, &key_buffer].concat();
                         let crc_to_check = compute_crc_data_block(&crc_data_block);
 
-                        reader.read_exact(&mut crc)?;
+                        read_exact_or_corrupt(&mut reader, &mut crc, curr_offset, path)?;
+                        curr_offset += 4;
 
                         let crc_from_buff = u32::from_le_bytes(crc);
                         if crc_to_check != crc_from_buff {
@@ -1132,25 +1195,27 @@ impl FlushingManager {
                                 reason: CorruptionType::CrcMismatch {
                                     expected: crc_to_check,
                                     found: crc_from_buff,
+                                    mismatch_type: CrcMismatchType::WalRecord,
                                 },
                             }));
                         }
-
+                        valid_bytes += key_size + 19;
                         pos = reader.stream_position()?;
                         memtable.delete(&key_buffer, u64::from_le_bytes(tstamp));
+                        records_recovered += 1;
                     }
                     TAG_INSERTION => {
-                        reader.read_exact(&mut tstamp)?;
-                        reader.read_exact(&mut ksz)?;
-                        reader.read_exact(&mut vsz)?;
+                        read_exact_or_corrupt(&mut reader, &mut tstamp, curr_offset, path)?;
+                        curr_offset += 8;
+                        read_exact_or_corrupt(&mut reader, &mut ksz, curr_offset, path)?;
+                        curr_offset += 8;
+                        read_exact_or_corrupt(&mut reader, &mut vsz, curr_offset, path)?;
+                        curr_offset += 8;
+
                         let key_size = u64::from_le_bytes(ksz);
                         let val_size = u64::from_le_bytes(vsz);
 
-                        if key_size > KEY_MAX_BYTES_SIZE
-                            || val_size > VALUE_MAX_BYTES_SIZE
-                            || pos + key_size + val_size + 29 > file_len
-                        // 1 + 8 + 8 + 8 + 4 = 29
-                        {
+                        if key_size > KEY_MAX_BYTES_SIZE || val_size > VALUE_MAX_BYTES_SIZE {
                             return Err(DbError::DataCorrupted(DataCorruptedErr {
                                 offset: pos,
                                 file_path: path.to_path_buf(),
@@ -1161,9 +1226,12 @@ impl FlushingManager {
                         }
                         let mut key_buffer = vec![0u8; key_size as usize];
                         let mut val_buffer = vec![0u8; val_size as usize];
-                        reader.read_exact(&mut key_buffer)?;
 
-                        reader.read_exact(&mut val_buffer)?;
+                        read_exact_or_corrupt(&mut reader, &mut key_buffer, curr_offset, path)?;
+                        curr_offset += key_size;
+
+                        read_exact_or_corrupt(&mut reader, &mut val_buffer, curr_offset, path)?;
+                        curr_offset += val_size;
 
                         let crc_data_block = [
                             type_of_record.as_slice(),
@@ -1176,9 +1244,11 @@ impl FlushingManager {
                         .concat();
                         let crc_to_check = compute_crc_data_block(&crc_data_block);
 
-                        reader.read_exact(&mut crc)?;
+                        read_exact_or_corrupt(&mut reader, &mut crc, curr_offset, path)?;
+                        curr_offset += 4;
 
                         let crc_from_buff = u32::from_le_bytes(crc);
+
                         if crc_to_check != crc_from_buff {
                             return Err(DbError::DataCorrupted(DataCorruptedErr {
                                 offset: pos,
@@ -1186,22 +1256,24 @@ impl FlushingManager {
                                 reason: CorruptionType::CrcMismatch {
                                     expected: crc_to_check,
                                     found: crc_from_buff,
+                                    mismatch_type: CrcMismatchType::WalRecord,
                                 },
                             }));
                         }
+                        valid_bytes += key_size + val_size + 29;
                         pos = reader.stream_position()?;
 
-                        memtable.put(&key_buffer, &val_buffer, u64::from_le_bytes(tstamp)); // PROBLEM: This out call will overwrite the actual timestamp of records
+                        memtable.put(&key_buffer, &val_buffer, u64::from_le_bytes(tstamp));
+                        records_recovered += 1;
 
                         // TAG_INSERTION handle tstamp | ksz | vsz | key | value |crc (4 bytes)
                     }
                     _ => {
+                        // corrupt
                         return Err(DbError::DataCorrupted(DataCorruptedErr {
-                            offset: pos,
+                            reason: CorruptionType::RecordTypeCorrupted { found: type_tag },
+                            offset: curr_offset - 1,
                             file_path: path.to_path_buf(),
-                            reason: Other(
-                                "Received corrupted record type while retrieving WAL".to_string(),
-                            ),
                         }));
                     }
                 }
@@ -1209,20 +1281,60 @@ impl FlushingManager {
             Ok(())
         })();
 
-        match outcome {
-            Ok(()) => {}
-            Err(e) => {
-                //
-            }
+        let replay_state = match outcome {
+            Ok(()) => WalReplayState::Clean,
+            Err(DbError::DataCorrupted(DataCorruptedErr {
+                reason: CorruptionType::TruncatedRecord,
+                offset,
+                ..
+            })) => WalReplayState::PartialTruncated,
+            Err(e) => WalReplayState::PartialCorrupt(e),
+        };
+        match replay_state {
+            replay_state @ WalReplayState::Clean => Ok(WalToMemtableReplay {
+                memtable,
+                records_recovered,
+                valid_bytes,
+                replay_state,
+            }),
+            replay_state @ WalReplayState::PartialTruncated => Ok(WalToMemtableReplay {
+                memtable,
+                records_recovered,
+                valid_bytes,
+                replay_state,
+            }),
+            replay_state @ WalReplayState::PartialCorrupt(_) => Ok(WalToMemtableReplay {
+                memtable,
+                records_recovered,
+                valid_bytes,
+                replay_state,
+            }),
         }
-        Ok(())
     }
 
-    fn retrieve_wal_records(&mut self, path: &PathBuf, dir: &PathBuf) -> Result<Option<SSTable>> {
-        let mut memtable = AVL::new(MEMTABLE_THRESHOLD);
-        self.build_avl_from_wal(&mut memtable, path)?;
+    fn retrieve_wal_records(
+        &mut self,
+        path: &PathBuf,
+        dir: &PathBuf,
+        hlc: &Hlc,
+    ) -> Result<Option<SSTable>> {
+        let memtable = match self.build_avl_from_wal(path) {
+            Ok(replay) => match replay.replay_state {
+                WalReplayState::Clean | WalReplayState::PartialTruncated => replay.memtable,
+                WalReplayState::PartialCorrupt(_) => {
+                    // TODO: caller might want to know that we worked on a corrupt file in the future
+                    // FOR LOGGING PURPOSES ^^
+                    replay.memtable
+                }
+            },
 
-        let (f, _, ss_final_path) = match memtable.sync_avl(dir) {
+            Err(e) => {
+                // Didnt retrieve anything
+                return Err(e);
+            }
+        };
+
+        let (f, _, ss_final_path) = match memtable.sync_avl(dir, hlc) {
             Ok(Some((f, tmp_file, ss_final_path))) => {
                 if let Some(dir) = ss_final_path.parent() {
                     // always should have parent
@@ -1240,7 +1352,12 @@ impl FlushingManager {
             Err(err) => {
                 return Err(err);
             }
-            Ok(None) => return Ok(None),
+            Ok(None) => {
+                return {
+                    let _ = fs::remove_file(path);
+                    Ok(None)
+                };
+            }
         };
         let sstable = SSTable::load(&ss_final_path)?;
 
@@ -1248,6 +1365,7 @@ impl FlushingManager {
     }
 }
 struct KVEngine {
+    // node_id: have a unique ID here
     data_directory: PathBuf, // data_directory now holds all .sst and .wal files
     // TODO: Need a way to split ssts into levels, L0, L1, L2 ..
     // Could be done with a manifest file that keeps metadata, but I can just do an easier way for now
@@ -1259,6 +1377,61 @@ struct KVEngine {
     flushing_memtable: Option<Weak<AVL>>, // and here
     corrupted_files: HashSet<FileId>,
     flushing_manager: FlushingManager,
+    hlc: Arc<Hlc>, // first 52 bits are the time stamp, 12 last bits are the counter
+}
+
+pub struct Hlc {
+    pub hlc: AtomicU64,
+}
+
+impl Hlc {
+    fn new() -> Self {
+        // we always create a new one for now, but in reality, we only create a new one on first boot, then we check the last most recent
+        // timestmap in the database and we check if we need a new timestamp or we use the last one + counter goes up
+        Self {
+            hlc: AtomicU64::new(new_timestamp() << NUM_OF_BITS_FOR_COUNTER),
+        } // counter starts at 0 here
+    }
+
+    fn curr_timestamp(&self) -> u64 {
+        new_timestamp() << 12
+    }
+    // fn remote
+    pub fn update_and_return_hlc(&self) -> u64 {
+        // return new HLC
+        let curr_tstamp = self.curr_timestamp();
+        let mut prev = self.hlc.load(Relaxed);
+        loop {
+            let hlc_tstamp = prev & MASK_FOR_TSTAMP;
+
+            let new = if hlc_tstamp >= curr_tstamp {
+                let new_counter = (prev & MASK_FOR_COUNTER) + 1;
+                if new_counter > MASK_FOR_COUNTER {
+                    // if counter overflows, we add 1 to the timestamp, so we are advancing the physical clock and resetting counter to 0
+                    // physical clock starts 12 bits to the left so thats why we add the operation below
+                    hlc_tstamp + (MASK_FOR_COUNTER + 1) // Mask is 12 ones, add 1 to get 4096
+                } else {
+                    hlc_tstamp | new_counter // new counter here is at most 4095 no need to use mask
+                }
+            } else {
+                curr_tstamp
+            };
+
+            match self
+                .hlc
+                .compare_exchange_weak(prev, new, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return new,
+                Err(x) => prev = x,
+            }
+        }
+    }
+
+    pub fn deserialize_hlc(hlc: u64) -> (u64, u64) {
+        // returns (timestmap, counter)
+        ((hlc >> NUM_OF_BITS_FOR_COUNTER), (hlc & MASK_FOR_COUNTER)) // timestamp okay to move down to lower bits, counter cant move up
+        // also todo: magic number bad
+    }
 }
 
 impl KVEngine {
@@ -1294,7 +1467,13 @@ impl KVEngine {
                 _ => continue,
             };
         }
-        let wal = WAL::new(MEMTABLE_THRESHOLD, sync_config, &path)?;
+        let hlc = Hlc::new();
+        let wal = WAL::new(
+            MEMTABLE_THRESHOLD,
+            sync_config,
+            &path,
+            hlc.update_and_return_hlc(),
+        )?;
         // IMPORTANT: The new wal is created after we check the actual directory for wal files.
         // This is important because we do not want to call retrieve_wal_records() on the new empty wal
 
@@ -1308,12 +1487,47 @@ impl KVEngine {
             frozen_wal: None,
             flushing_manager: FlushingManager::new(),
             corrupted_files: HashSet::new(),
+            hlc: Arc::new(hlc),
         };
 
         for path in sst_vec {
             match SSTable::load(&path) {
-                Ok(s) => sstables.push(s),
-                Err(e) => {}
+                Ok(sst) => sstables.push(sst),
+                Err(DbError::DataCorrupted(DataCorruptedErr {
+                    reason:
+                        CorruptionType::CrcMismatch {
+                            mismatch_type: CrcMismatchType::SparseIndex,
+                            ..
+                        }
+                        | CorruptionType::MetaDataSizeExceedsFileSize { .. }
+                        | CorruptionType::MetadataSizeOverflow { .. },
+                    ..
+                })) => {
+                    // rebuild all the metadata(sparse, bloom, min max etc)
+                    // what needs to be done here? we have a sstable with presumably some correct data in there but
+                    // the metadata is corrupt, do I read the sstable front to back and create the metadata as we go?
+                    // Read the sstable in order(needs the change below), write a new sstable with all the valid data_records
+                    // while also building the bloom_filter, sparse_index etc, attach all metadata at the end
+                    // then name the rebuilt sstable the same as the sstable with the corrupt metadata so we preserve key recency order
+
+                    // Note: For now I'm just going to treat the sstable as corrupt and the data lost because I need to change
+                    // the sparse_index format to be firstkey: offset and have the offset point to the data_block_length in the front of a
+                    // data_block, so we jump to that offset, the first 8 bytes tell us the data_block_length, then we read the data_block
+                    // compared to what I have now: firstkey: (offset, data_block_length) which means I need the sparse_index to know where
+                    // and how long the data_block_length is, meaning if there is a corrupt sparse_index, I cannot rebuild it because
+                    // I dont know where data_blocks start or end
+                    // LEAVING THIS HERE BECAUSE I WILL IMPLEMENT THIS LATER
+                }
+                Err(
+                    DbError::InvalidSstableFileName(_p) | DbError::NonNumericFileIdOnSstable(_p),
+                ) => {
+                    continue;
+                }
+                Err(dberr) => {
+                    continue;
+                    // we can reach here if read_exact fails for example or seeking fails
+                    // what to do? skip for now
+                }
             }
         }
 
@@ -1334,14 +1548,22 @@ impl KVEngine {
         });
         for path in wal_vec {
             // wal populates this and we flush it to disk as an .sst
-            if let Some(ss) = self_instance
-                .flushing_manager
-                .retrieve_wal_records(&path, &self_instance.data_directory)?
-            {
-                sstables.push(ss);
+
+            match self_instance.flushing_manager.retrieve_wal_records(
+                &path,
+                &self_instance.data_directory,
+                &self_instance.hlc,
+            ) {
+                // TIHS SHOULD ANTICIPATE THE SPARSE_INDEX_CRC_MISMATCH FAILURE IN THE FUTURE
+                // WHERE WE WILL REBUILD THE SSTABLE
+                // FOR NOW, IF IT FAILS WE DONT PUSH SST
+                Ok(Some(ss)) => {
+                    sstables.push(ss);
+                }
+                Err(e) => continue,
+                Ok(None) => continue,
             }
         }
-
         sstables.sort_by_key(|p| Reverse(p.id)); // Descending order
 
         self_instance.sstables = Some(Arc::new(RwLock::new(sstables)));
@@ -1349,12 +1571,18 @@ impl KVEngine {
     }
 
     fn should_search_sstable_file(key: &[u8], sstable: &SSTable) -> bool {
-        if key > sstable.max_key.as_slice() || key < sstable.min_key.as_slice() {
+        if let Some((min, max)) = &sstable.min_max_keys
+            && (key > max.as_slice() || key < min.as_slice())
+        {
             return false;
         }
-        let bf_bit_positions =
-            get_hashed_key_positions(key, sstable.bloom_filter.num_bits as usize);
-        sstable.bloom_filter.check_bits(bf_bit_positions)
+
+        if let Some(bloom_filter) = &sstable.bloom_filter {
+            let bf_bit_positions = get_hashed_key_positions(key, bloom_filter.num_bits as usize);
+            bloom_filter.check_bits(bf_bit_positions)
+        } else {
+            true // If we do not have a bloom filter, we just search the file without bloom filter optimization
+        }
     }
 
     fn search_kv_in_sstable(sstable: &SSTable, key: &[u8]) -> Result<Lookup> {
@@ -1377,14 +1605,13 @@ impl KVEngine {
         let mut crc = [0u8; 4];
 
         let mut reader = BufReader::new(&sstable.file);
-        // just read the entire data_buffer instead of using a BufReader
+
         reader.seek(SeekFrom::Start(offset))?;
 
         reader.read_exact(&mut data_buffer)?;
 
         //
         // we read CRC here because data_len above doesnt take into account the 4 bytes for crc
-
         reader.read_exact(&mut crc)?;
         let crc_from_buff = u32::from_le_bytes(crc);
 
@@ -1397,6 +1624,7 @@ impl KVEngine {
                 reason: CorruptionType::CrcMismatch {
                     expected: crc_from_buff,
                     found: fresh_crc,
+                    mismatch_type: CrcMismatchType::DataBlock,
                 },
             }));
         }
@@ -1465,17 +1693,17 @@ impl KVEngine {
             // let value: &[u8] = &data_buffer[val_start..val_end];
 
             match curr_key.cmp(key) {
-                Ordering::Less => {
+                CmpOrdering::Less => {
                     pos = val_end;
                     continue;
                 }
-                Ordering::Equal => {
+                CmpOrdering::Equal => {
                     if deleted == 0xFF {
                         return Ok(Deleted);
                     }
                     return Ok(Found(value.to_vec()));
                 }
-                Ordering::Greater => break,
+                CmpOrdering::Greater => break,
             }
         }
         Ok(Absent)
@@ -1527,11 +1755,12 @@ impl KVEngine {
         {
             self.rotate_memtable_and_wal()?;
         }
-        let tstamp = new_timestamp();
+        // let tstamp = new_timestamp();
+        let hlc = self.hlc.update_and_return_hlc();
         self.wal
-            .record_to_wal(WalRecordType::Insertion(key, value), tstamp)?;
+            .record_to_wal(WalRecordType::Insertion(key, value), hlc)?;
 
-        self.memtable.put(key, value, tstamp);
+        self.memtable.put(key, value, hlc);
 
         Ok(())
     }
@@ -1542,10 +1771,10 @@ impl KVEngine {
         if (k_len + self.memtable.size_in_bytes) > self.memtable.threshold {
             self.rotate_memtable_and_wal()?;
         }
-        let tstamp = new_timestamp();
-        self.wal
-            .record_to_wal(WalRecordType::Deletion(key), tstamp)?;
-        self.memtable.delete(key, tstamp);
+        // let tstamp = new_timestamp();
+        let hlc = self.hlc.update_and_return_hlc();
+        self.wal.record_to_wal(WalRecordType::Deletion(key), hlc)?;
+        self.memtable.delete(key, hlc);
 
         Ok(())
     }
@@ -1553,7 +1782,12 @@ impl KVEngine {
     fn rotate_memtable_and_wal(&mut self) -> Result<()> {
         let old_wal = std::mem::replace(
             &mut self.wal,
-            WAL::new(MEMTABLE_THRESHOLD, self.sync_config, &self.data_directory)?,
+            WAL::new(
+                MEMTABLE_THRESHOLD,
+                self.sync_config,
+                &self.data_directory,
+                self.hlc.update_and_return_hlc(),
+            )?,
         );
         // WHEN MAIN(whoever polls it) RECEIVES A SUCCESSFUL FLUSH, REMOVE THE OLD WAL ASSOCIATED WITH THAT FLUSH
         let frozen = Arc::new(std::mem::replace(
@@ -1565,8 +1799,12 @@ impl KVEngine {
 
         self.frozen_wal = Some(old_wal);
 
-        self.flushing_manager
-            .background_flush_memtable(frozen, self.data_directory.clone())?;
+        let hlc = Arc::clone(&self.hlc);
+        self.flushing_manager.background_flush_memtable(
+            frozen,
+            self.data_directory.clone(),
+            hlc,
+        )?;
 
         Ok(())
     }
@@ -1574,17 +1812,24 @@ impl KVEngine {
 
 /*Notes:
  // footer is : sparse_index | bloom_filter | min key | max key |  sparse_index_offset| sizeof(sparse_index) | sizeof(bloom_filter) | sizeof(minkey) | sizeof(maxkey) | sparse_crc(4 bytes) | bloom_crc(4 bytes) | min_max_key_crc | metadata_crc(4 bytes) |
- //TODO: need a CRC for the metadata
+
 DataBlocks:  [ tstamp(8) | ksz(8) | value_sz(8) | key | value  tstamp(8) | ksz(8) | value_sz(8) | key | value ... crc(4)]
 SSTable: Datablock1 | DataBlock2 ... Datablock N | Footer
 Bloom filter: k-hash bit array per SSTable to skip files on negative lookups. Use 10 bits per key. Built during flush of AVL.
 */
+
 // SparseIndex => [ firskey:[offset, datablock_length] ]
+
+// TODO: have SparseIndex be -> [firstkey: [offsert(points to start of data_block)] ]
+// then have the data_block be datablock_length | record1| record2 ... crc
+// this way we can reconstruct the sparse_index in the case of a sparse_index corruption because we can just read the records front to back without the need for the sparse_index
+
 // wal record looks like: ksz, vsz, k, v, crc(4 bytes)
 // When you read a data block in the sparse index, remember to account for the 4 crc bytes yourself, they are not accounted forin the length
 /*
 
-
+CHANGE: timestamp now is a u64 which is separated into 2 parts: the upper 52 bits are a timestamp in microseconds, the lower 12 bits are a counter
+// this way it is guaranteed that "time" doesnt drift backwards and will also be useful if/when I add replicas
 
 
 
@@ -1597,10 +1842,11 @@ Bloom filter: k-hash bit array per SSTable to skip files on negative lookups. Us
  TODO: Modularize the components into their own files
  TODO.1: Document how things work
 
- TODO(IMPORTANT): Add crc to the footer metadata as well
- // ALSO TODO(done): Make sure everything gets serialized as u64 and dont use usize
-// TODO: Decide what to do when other footer metadata is corrupted other than sparse_index
-// sparse_index definitely needs to be rebuilt if thats the case, what about bloom filter, minmax keys?
+TODO: USE A SEQUENCE NUMBER INSTEAD OF TIMESTAMP AS A LOGICAL CLOCK
+Atomics u64
+
+TODO: USE read_exact_at from FileExt trait in place of every read_exact call()
+
 // TODO: WRITE TESTS
  //
 

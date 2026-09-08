@@ -22,12 +22,13 @@ use crc::{CRC_32_ISO_HDLC, Crc};
 
 use crate::errors::CompactionErr::{self, HeapNotFound};
 use crate::errors::CorruptionType::{self, TruncatedRecord};
+use crate::errors::CrcMismatchType;
 use crate::helpers::{
     check_key_value_record_does_not_exceed_max, compute_crc_data_block, create_new_data_file,
-    get_positions_from_hashed_key, hash_key,
+    get_positions_from_hashed_key, hash_key, read_exact_or_corrupt,
 };
 use crate::lsm::{
-    AVL, BloomFilter, DATA_BLOCK_MAX_BYTES_SIZE, MAX_SST_SIZE, SparseIndex, SsTableDataBlock,
+    AVL, BloomFilter, DATA_BLOCK_MAX_BYTES_SIZE, Hlc, MAX_SST_SIZE, SparseIndex, SsTableDataBlock,
 };
 use crate::{
     errors::{DataCorruptedErr, DbError, Result},
@@ -53,8 +54,8 @@ struct SstFinalizer {
 }
 
 impl SstFinalizer {
-    fn new(dir: &Path, starting_key: Vec<u8>) -> Result<Self> {
-        let (file, tmp_file, final_file) = create_new_data_file(dir)?;
+    fn new(dir: &Path, starting_key: Vec<u8>, hlc: &Hlc) -> Result<Self> {
+        let (file, tmp_file, final_file) = create_new_data_file(dir, hlc)?;
         let writer = BufWriter::new(file);
         Ok(Self {
             writer,
@@ -175,26 +176,6 @@ impl CompactionFileElement {
         self.current_data_block.is_none()
     }
 
-    fn read_exact_or_corrupt(
-        reader: &mut impl Read,
-        buf: &mut [u8],
-        offset: u64,
-        file_path: &Path,
-    ) -> Result<()> {
-        // if we get a truncated record, we have corrupted data
-        reader.read_exact(buf).map_err(|e| {
-            if e.kind() == UnexpectedEof {
-                DbError::DataCorrupted(DataCorruptedErr {
-                    offset,
-                    file_path: file_path.to_path_buf(),
-                    reason: TruncatedRecord,
-                })
-            } else {
-                DbError::Io(e)
-            }
-        })
-    }
-
     fn advance_data_block_header(&mut self) -> Result<Option<HeapEntry>> {
         let mut tstamp = [0u8; 8];
         let mut ksz = [0u8; 8];
@@ -208,7 +189,7 @@ impl CompactionFileElement {
             let file_path = &self.sst_slice.file_path;
 
             // if any read_exact_or_corrupt calls return UnexpectedEof, then we have a truncated error and we should throw data block and remainder of file away
-            Self::read_exact_or_corrupt(
+            read_exact_or_corrupt(
                 &mut curr_data_block.bytes,
                 &mut tstamp,
                 self.curr_offset_from_file,
@@ -216,7 +197,7 @@ impl CompactionFileElement {
             )?;
 
             self.curr_offset_from_file += 8;
-            Self::read_exact_or_corrupt(
+            read_exact_or_corrupt(
                 &mut curr_data_block.bytes,
                 &mut ksz,
                 self.curr_offset_from_file,
@@ -232,7 +213,7 @@ impl CompactionFileElement {
             )?;
             self.curr_offset_from_file += 8;
 
-            Self::read_exact_or_corrupt(
+            read_exact_or_corrupt(
                 &mut curr_data_block.bytes,
                 &mut vsz,
                 self.curr_offset_from_file,
@@ -247,7 +228,7 @@ impl CompactionFileElement {
                 file_path,
             )?;
             self.curr_offset_from_file += 8;
-            Self::read_exact_or_corrupt(
+            read_exact_or_corrupt(
                 &mut curr_data_block.bytes,
                 &mut tmbstone,
                 self.curr_offset_from_file,
@@ -270,7 +251,7 @@ impl CompactionFileElement {
             };
 
             let mut key = vec![0u8; key_size as usize];
-            Self::read_exact_or_corrupt(
+            read_exact_or_corrupt(
                 &mut curr_data_block.bytes,
                 &mut key,
                 self.curr_offset_from_file,
@@ -279,7 +260,7 @@ impl CompactionFileElement {
             self.curr_offset_from_file += key_size;
 
             let mut val = vec![0u8; val_size as usize];
-            Self::read_exact_or_corrupt(
+            read_exact_or_corrupt(
                 &mut curr_data_block.bytes,
                 &mut val,
                 self.curr_offset_from_file,
@@ -326,10 +307,10 @@ impl CompactionFileElement {
 
         let mut bytes = vec![0u8; data_len as usize];
         let mut crc = [0u8; 4];
-        Self::read_exact_or_corrupt(reader, &mut bytes, self.curr_offset_from_file, &file_path)?;
+        read_exact_or_corrupt(reader, &mut bytes, self.curr_offset_from_file, &file_path)?;
         self.curr_offset_from_file += data_len;
 
-        Self::read_exact_or_corrupt(reader, &mut crc[..], self.curr_offset_from_file, &file_path)?;
+        read_exact_or_corrupt(reader, &mut crc[..], self.curr_offset_from_file, &file_path)?;
 
         let crc_to_check = compute_crc_data_block(&bytes);
         let crc_from_buff = u32::from_le_bytes(crc);
@@ -342,6 +323,7 @@ impl CompactionFileElement {
                 reason: CorruptionType::CrcMismatch {
                     expected: crc_to_check,
                     found: crc_from_buff,
+                    mismatch_type: CrcMismatchType::DataBlock,
                 },
             }));
         };
@@ -365,6 +347,7 @@ struct CompactionManager {
     heap: Option<BinaryHeap<Reverse<MergeItem>>>,
     compaction_outcome: Option<CompactionOutcome>,
     data_dir: PathBuf,
+    hlc: Arc<Hlc>,
 }
 #[derive(Default)]
 pub struct CompactionOutcome {
@@ -387,7 +370,7 @@ impl CompactionOutcome {
 
 impl CompactionManager {
     // have main have a select_files_for_compaction function -> Vec<PathBuf>
-    fn new(files: Vec<CompactionSstSlice>, data_dir: PathBuf) -> Result<Self> {
+    fn new(files: Vec<CompactionSstSlice>, data_dir: PathBuf, hlc: Arc<Hlc>) -> Result<Self> {
         let mut cmpt_outcome = CompactionOutcome::new();
         let (tx, rx) = mpsc::channel::<CompactionThreadResponse>();
         let mut cfe_vec: Vec<CompactionFileElement> = Vec::with_capacity(files.len());
@@ -432,6 +415,7 @@ impl CompactionManager {
             heap: Some(heap),
             compaction_outcome: Some(cmpt_outcome),
             data_dir,
+            hlc,
         })
     }
 
@@ -448,6 +432,7 @@ impl CompactionManager {
         // TODO: dont pass sst paths, have merge_to_final open the files and if it exceeds MAX_SST_SIZE, then open a new sst file and continue merging the inputs therex
 
         // this error should actually never happen, heap gets built during new() and if new returns, it will always be populated
+        let hlc = Arc::clone(&self.hlc);
         let Some(heap) = self.heap.take() else {
             let _ = tx.send(CompactionThreadResponse::Error(DbError::CompactionError(
                 HeapNotFound,
@@ -475,6 +460,7 @@ impl CompactionManager {
                     heap,
                     &mut cfe_vec,
                     data_directory,
+                    hlc,
                 )?;
 
                 cmpt.final_sst_files.iter().try_for_each(
@@ -573,6 +559,7 @@ impl CompactionManager {
         mut heap: BinaryHeap<Reverse<MergeItem>>,
         cfe_vec: &mut [CompactionFileElement],
         data_dir: PathBuf,
+        hlc: Arc<Hlc>,
     ) -> Result<CompactionOutcome> {
         let min_k = heap
             .peek()
@@ -581,7 +568,8 @@ impl CompactionManager {
             .entry
             .key
             .clone(); // grab min key before we start
-        let mut sst_finalizer = SstFinalizer::new(&data_dir, min_k)?;
+
+        let mut sst_finalizer = SstFinalizer::new(&data_dir, min_k, &hlc)?;
         let mut last_k_written: Option<Vec<u8>> = None;
 
         while let Some(curr_merge_item) = heap.pop().as_mut() {
@@ -592,7 +580,7 @@ impl CompactionManager {
                     // TODO: add finished file to vector of finished files
                     compaction_outcome.final_sst_files.push(finished_ssts);
                     sst_finalizer =
-                        SstFinalizer::new(&data_dir, curr_merge_item.0.entry.key.clone())?; // after 160MB, one sst is done
+                        SstFinalizer::new(&data_dir, curr_merge_item.0.entry.key.clone(), &hlc)?; // after 160MB, one sst is done
                 }
 
                 sst_finalizer
@@ -631,7 +619,7 @@ impl CompactionManager {
 
             let cfe = cfe_vec.get_mut(curr_merge_item.0.source).expect(
                 "source index is always valid: cfe_vec is append-only and idx is assigned pre push",
-            );
+            ); // TODO: dont expect anyways, just throw err
             // if item is the same as last one, we are skipping it because the newer key has already been written to final file
             let _ = MergeItem::new(cfe, curr_merge_item.0.source)
                 .map(|x| {
@@ -661,13 +649,22 @@ impl CompactionManager {
     }
 }
 
+//TODO Ordering needs to be updated after HLC is implementd
 impl Ord for MergeItem {
     fn cmp(&self, other: &Self) -> Ordering {
+        let (tstamp_other, counter_other) = Hlc::deserialize_hlc(other.entry.timestamp);
+        let (tstamp_self, counter_self) = Hlc::deserialize_hlc(self.entry.timestamp);
         self.entry
             .key
             .cmp(&other.entry.key) // smaller wins
-            .then_with(|| other.entry.timestamp.cmp(&self.entry.timestamp)) // larger wins(newer)
-            .then_with(|| self.source.cmp(&other.source)) // smaller wins, sources are ordered smaller->bigger. smaller id means file is newer, file contains the fresh key
+            .then_with(|| {
+                // "timestamp" is now an hlc, the most significant 52 bits are the timestamp
+                // the other 12 are the counter so keep in mind
+
+                tstamp_other.cmp(&tstamp_self)
+                // other.entry.timestamp.cmp(&self.entry.timestamp)
+            }) // larger wins(newer)
+            .then_with(|| counter_other.cmp(&counter_self)) // smaller wins, sources are ordered smaller->bigger. smaller id means file is newer, file contains the fresh key
     }
 }
 
