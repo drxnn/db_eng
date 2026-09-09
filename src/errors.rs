@@ -3,11 +3,10 @@ use std::{
     error::Error,
     fmt::{Formatter, write},
     io,
+    num::ParseIntError,
     path::PathBuf,
     write,
 };
-
-use crate::errors::InvalidMemtableInput::KeySizeTooLarge;
 
 #[derive(Debug)]
 
@@ -17,7 +16,7 @@ pub struct DataCorruptedErr {
     pub reason: CorruptionType,
 }
 #[derive(Debug)]
-pub enum CrcMismatchType {
+pub enum CrcType {
     // can add more as needed
     MinMaxFooterKeys,
     BloomFilter,
@@ -33,7 +32,7 @@ pub enum CorruptionType {
     CrcMismatch {
         expected: u32,
         found: u32,
-        mismatch_type: CrcMismatchType,
+        mismatch_type: CrcType,
     },
     Other(String),
     LengthMismatch {
@@ -73,6 +72,7 @@ pub enum DbError {
     MissingKey(String),
     MissingHeapEntry(String, PathBuf),
     Io(std::io::Error),
+    PathFailedToParseToInt(PathBuf, ParseIntError),
     FileError(String, PathBuf),
     MemTableSyncError(String),
     ReportedViaChannel,
@@ -81,6 +81,7 @@ pub enum DbError {
     DataBlockExhausted,
     TooManyFilesOpenInProcess,
     TooManyFilesOpenInSystem,
+    WalNotFound,
     NonNumericFileIdOnSstable(PathBuf),
     InvalidSstableFileName(PathBuf),
     InvalidMemtableInput(InvalidMemtableInput),
@@ -97,20 +98,16 @@ impl From<InvalidMemtableInput> for DbError {
         DbError::InvalidMemtableInput(e)
     }
 }
+
 impl From<io::Error> for DbError {
     fn from(e: io::Error) -> Self {
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
         match e.raw_os_error() {
             Some(24) => return DbError::TooManyFilesOpenInProcess,
             Some(23) => return DbError::TooManyFilesOpenInSystem,
             _ => {}
         }
-        #[cfg(target_os = "linux")]
-        match e.raw_os_error() {
-            Some(24) => return DbError::TooManyFilesOpenInProcess,
-            Some(23) => return DbError::TooManyFilesOpenInSystem,
-            _ => {}
-        }
+
         #[cfg(windows)]
         match e.raw_os_error() {
             Some(4) => return DbError::TooManyFilesOpenInProcess,
@@ -277,6 +274,17 @@ impl fmt::Display for DbError {
                 write!(
                     f,
                     "tried to read {start}..{end}, but the buffer is {len} bytes"
+                )
+            }
+            Self::WalNotFound => {
+                write!(f, "Invalid State: WAL not found in running engine")
+            }
+            Self::PathFailedToParseToInt(p, e) => {
+                write!(
+                    f,
+                    "Failed to parse the numeric part of file name to an integer. Path: {}. Error: {}",
+                    p.display(),
+                    e
                 )
             }
         }

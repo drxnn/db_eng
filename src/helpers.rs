@@ -1,5 +1,8 @@
 use crate::{
-    errors::{CorruptionType::TruncatedRecord, Result},
+    errors::{
+        CorruptionType::{self, TruncatedRecord},
+        CrcType, Result,
+    },
     lsm::Hlc,
 };
 use crc::{CRC_32_ISO_HDLC, Crc};
@@ -46,10 +49,6 @@ use std::{
 use crate::errors::{DataCorruptedErr, DbError};
 
 pub fn new_timestamp() -> u64 {
-    // TODO: use an Atomics<u64>
-    // Actually keep timestamp just add a logical counter for ordering of events modelled after HLC
-    //
-
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -113,6 +112,41 @@ pub fn read_exact_or_corrupt(
     })
 }
 // helper for key and value record check only
+
+pub fn check_crc(
+    crc_to_check: u32,
+    crc_in_file: u32,
+    offset: u64,
+    file_path: &Path,
+    crc_type: CrcType,
+) -> Result<()> {
+    if crc_to_check != crc_in_file {
+        Err(DbError::DataCorrupted(DataCorruptedErr {
+            offset,
+            file_path: file_path.to_path_buf(),
+            reason: CorruptionType::CrcMismatch {
+                expected: crc_in_file,
+                found: crc_to_check,
+                mismatch_type: crc_type,
+            },
+        }))
+    } else {
+        Ok(())
+    }
+}
+
+// pub fn check_length_does_not_exceed_max(
+//     length: u64,
+//     max_length: u64,
+//     offset: u64,
+//     file_path: &PathBuf,
+//     err_to_throw: DataCorruptedErr,
+// ) -> Result<()> {
+//     if length > max_length {
+//     } else {
+//         Ok(())
+//     }
+// }
 pub fn check_key_value_record_does_not_exceed_max(
     size: u64,
     max_size: u64,
@@ -133,10 +167,27 @@ pub fn check_key_value_record_does_not_exceed_max(
     }
 }
 
+pub fn get_hlc_from_valid_pathbuf(path: &Path) -> Result<u64> {
+    let stem = path
+        .file_stem()
+        .and_then(|x| x.to_str())
+        .ok_or_else(|| DbError::InvalidSstableFileName(path.to_path_buf()))?;
+
+    stem.parse::<u64>()
+        .map_err(|e| DbError::PathFailedToParseToInt(path.to_path_buf(), e))
+}
+
+pub fn find_max_hlc_between_files(path_bufs: &[PathBuf]) -> Option<u64> {
+    path_bufs
+        .iter()
+        .filter_map(|x| get_hlc_from_valid_pathbuf(x).ok())
+        .max()
+}
+
 pub fn create_new_data_file(dir: &Path, hlc: &Hlc) -> io::Result<(File, PathBuf, PathBuf)> {
     // let tstamp = new_timestamp();
 
-    let ts = hlc.update_and_return_hlc();
+    let ts = hlc.tick();
     let data_file_path_final = dir.join(format!("{}.sst", ts));
     let data_file_path_tmp = dir.join(format!("{}.sst.tmp", ts));
     let data_file = OpenOptions::new()

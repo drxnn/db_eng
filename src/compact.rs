@@ -21,11 +21,11 @@ use std::{
 use crc::{CRC_32_ISO_HDLC, Crc};
 
 use crate::errors::CompactionErr::{self, HeapNotFound};
-use crate::errors::CorruptionType::{self, TruncatedRecord};
-use crate::errors::CrcMismatchType;
+
+use crate::errors::CrcType;
 use crate::helpers::{
-    check_key_value_record_does_not_exceed_max, compute_crc_data_block, create_new_data_file,
-    get_positions_from_hashed_key, hash_key, read_exact_or_corrupt,
+    check_crc, check_key_value_record_does_not_exceed_max, compute_crc_data_block,
+    create_new_data_file, get_positions_from_hashed_key, hash_key, read_exact_or_corrupt,
 };
 use crate::lsm::{
     AVL, BloomFilter, DATA_BLOCK_MAX_BYTES_SIZE, Hlc, MAX_SST_SIZE, SparseIndex, SsTableDataBlock,
@@ -55,6 +55,18 @@ struct SstFinalizer {
 
 impl SstFinalizer {
     fn new(dir: &Path, starting_key: Vec<u8>, hlc: &Hlc) -> Result<Self> {
+        // PROBLEM: Our OUTPUT Sst file has the newest hlc regardless of the data thats in there,
+        // could be old data thats being compacted and now its the newest data
+        // Do: just use the highest HLC of the files being compacted into this one
+        // The Hlc of the SST is calculated at the time of flushing which means the Hlc is > than the biggest Hlc of the max key in the sst
+        // Bigger Hlc == more recent
+        // we are also going up a level so we need to make sure the key range in the newly compacted sst is correctly ordered with the other sst files in that levle
+        // ALSO TODO: Add another metadata byte in the ssts, Level:
+        // File picker for compaction: pick one file in L_n, then find all the overlapping ssts in L_(n+1) and compact all of these together.
+        // output gets placed in L(n+1)
+        // in L0, compact every L0 wit every L1 sst
+        //
+
         let (file, tmp_file, final_file) = create_new_data_file(dir, hlc)?;
         let writer = BufWriter::new(file);
         Ok(Self {
@@ -140,7 +152,6 @@ impl MergeItem {
         let key = &self.entry.key;
         let value = &self.entry.value;
 
-        // let value = cfe.take_value_and_advance(&self.entry)?;
         let record = [&tstamp, &ksz, &vsz, &deleted[..], key, value].concat();
         Ok(record)
     }
@@ -316,17 +327,14 @@ impl CompactionFileElement {
         let crc_from_buff = u32::from_le_bytes(crc);
         // Todo: the crc check/throw error needs to be put in a function, gets reused a lot
         // have the caller account for this error
-        if crc_to_check != crc_from_buff {
-            return Err(DbError::DataCorrupted(DataCorruptedErr {
-                offset,
-                file_path: self.sst_slice.file_path.to_path_buf(),
-                reason: CorruptionType::CrcMismatch {
-                    expected: crc_to_check,
-                    found: crc_from_buff,
-                    mismatch_type: CrcMismatchType::DataBlock,
-                },
-            }));
-        };
+
+        check_crc(
+            crc_to_check,
+            crc_from_buff,
+            offset,
+            &self.sst_slice.file_path,
+            CrcType::DataBlock,
+        )?;
 
         new_data_block.append_to_block(&bytes); // whole datablock
 
@@ -351,6 +359,7 @@ struct CompactionManager {
 }
 #[derive(Default)]
 pub struct CompactionOutcome {
+    // TODO final_sst_files just needs the final, why do we have tmp? when we have a final_sst just unlink tmp
     pub final_sst_files: Vec<(PathBuf, PathBuf)>, // (tmp_file, final_file). Tmp holds the data, atomically rename to final
     pub consumed_sst_files: Vec<PathBuf>,         // files that were completely merged
     pub partially_consumed_sst_files: Vec<(PathBuf, DbError)>, // files that were partially merged but then stumbled upon corrupted data
@@ -421,13 +430,6 @@ impl CompactionManager {
 
     fn background_compact(&mut self) -> Result<()> {
         let tx: Sender<CompactionThreadResponse> = self.tx.clone();
-
-        // TODO: let sst_paths get generated in merge_to_final since we might have to output multiple ssts
-        // so return the finalized merged files(both tmp and final and loop them to rename them atomically)
-        // so merge_to_final should check whether the current open sst final file has exceeded max size(metadata footer not included)
-        // if yes, sync everything, add tmp_path and final_path to a vector to return to background_compact
-        // then create new paths create_new_data_file, mutate the writer to wrap the new file
-        // loop this
 
         // TODO: dont pass sst paths, have merge_to_final open the files and if it exceeds MAX_SST_SIZE, then open a new sst file and continue merging the inputs therex
 
@@ -500,7 +502,7 @@ impl CompactionManager {
     }
 
     fn finalize_output_merged_file(mut sst_finalizer: SstFinalizer) -> Result<(PathBuf, PathBuf)> {
-        // return tmp and final.sst
+        // return final.sst
 
         let len = sst_finalizer.data_block.bytes.get_ref().len() as u64;
         let max_k = sst_finalizer.data_block.grab_max_key_from_data_block()?;
@@ -520,6 +522,8 @@ impl CompactionManager {
             let positions = get_positions_from_hashed_key(*h_key, bloom_filter.num_bits as usize);
             bloom_filter.set_bits(positions);
         });
+
+        // Level needs to be provided
         let footer = AVL::serialize_sstable_footer(
             sst_finalizer.offset,
             &min_k,
@@ -527,8 +531,9 @@ impl CompactionManager {
             sst_finalizer.sparse_index.index_entries.len() as u64,
             (bloom_filter.bits.len() * 8) as u64,
         );
-        let footer_crc = compute_crc_data_block(&footer[footer.len() - 40..]);
-        let min_max_crc = compute_crc_data_block(&footer[..footer.len() - 40]);
+        // Repeating myself below with the boundary checks, put in a function
+        let footer_crc = compute_crc_data_block(&footer[footer.len() - 41..]);
+        let min_max_crc = compute_crc_data_block(&footer[..footer.len() - 41]);
         let sparse_crc = compute_crc_data_block(&sst_finalizer.sparse_index.index_entries);
 
         sst_finalizer
@@ -569,6 +574,8 @@ impl CompactionManager {
             .key
             .clone(); // grab min key before we start
 
+        // TODO: THE sst_finalizer below is assigned a new HLC, use the HIGHEST HLC from the input files instead.
+        // THE HEAP HAS A NODE FOR EACH FILE INPUT, JUST GRAB THE HLC THATS THE HIGHEST FROM THOSE
         let mut sst_finalizer = SstFinalizer::new(&data_dir, min_k, &hlc)?;
         let mut last_k_written: Option<Vec<u8>> = None;
 
@@ -577,7 +584,7 @@ impl CompactionManager {
                 let record = curr_merge_item.0.serialize_record()?;
                 if sst_finalizer.would_exceed_max_sst_size(record.len() as u64) {
                     let finished_ssts = Self::finalize_output_merged_file(sst_finalizer)?;
-                    // TODO: add finished file to vector of finished files
+
                     compaction_outcome.final_sst_files.push(finished_ssts);
                     sst_finalizer =
                         SstFinalizer::new(&data_dir, curr_merge_item.0.entry.key.clone(), &hlc)?; // after 160MB, one sst is done
@@ -664,7 +671,7 @@ impl Ord for MergeItem {
                 tstamp_other.cmp(&tstamp_self)
                 // other.entry.timestamp.cmp(&self.entry.timestamp)
             }) // larger wins(newer)
-            .then_with(|| counter_other.cmp(&counter_self)) // smaller wins, sources are ordered smaller->bigger. smaller id means file is newer, file contains the fresh key
+            .then_with(|| counter_other.cmp(&counter_self))
     }
 }
 
