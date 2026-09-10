@@ -36,6 +36,7 @@ pub const DATA_BLOCK_MAX_BYTES_SIZE: u64 = 155673; // 8192(max db_size) + KEY_MA
 pub const MAX_SST_SIZE: u64 = 1024 * 1024 * 160;
 const TAG_DELETION: u8 = 2;
 const TAG_INSERTION: u8 = 4;
+pub const SST_LEVEL_COUNT: usize = 7;
 pub const KEY_MAX_BYTES_SIZE: u64 = 16384;
 pub const VALUE_MAX_BYTES_SIZE: u64 = 131072;
 pub const NUM_OF_BITS_FOR_TSTAMP: u8 = 52;
@@ -176,8 +177,6 @@ impl BloomFilter {
     }
 }
 
-struct FileId(u64);
-
 struct WAL {
     wal_writer: Option<BufWriter<File>>,
     sync_c: SyncConfig,
@@ -193,11 +192,16 @@ impl WAL {
         parent_dir: &PathBuf,
         curr_hlc: u64,
     ) -> io::Result<WAL> {
-        // let tstamp = new_timestamp();
-
         let wal_path = parent_dir.join(format!("{}.wal", curr_hlc));
 
-        //
+        //PROBLEM: WALs HLC is at CREATION TIME, HOWEVER WAL CONTAINS RECORDS THAT HAVE A MORE RECENT HLC
+        // WHICH IS AN ISSUE BECAUSE ON REBOOT WHEN WE ARE TRYING TO RECOVER HLC TO BE THE MOST RECENT, WE CHECK ALL THE SSTS HLC(WHICH ARE CREATED AT SYNC TIME=GOOD)
+        // BUT WALS HLCS THAT ARE USED FOR COMPARISONS ARE NOT EXACTLY CORRECT BECAUSE THERE IS RECORDS IN THERE WITH NEWER HLC, SO NEED A WAY TO GET THE MAX_HLC INSIDE THE WAL
+        // SO THAT WE RECOVER TO THE MOST RECENT HLC ON REBOOT AND THERE IS NO TIME DRIFT AT ALL.
+        // IMAGINE: WE RECOVER TO A HLC THAT IS (HLC_OF_SOME_WAL_FILE + 1), THEN WE SYNC THE WAL(WHICH CONTAINS KEYS WITH NEWER HLC THAN THAT) AND WE GIVE THE NEW SST
+        // THE NAME OF (HLC_OF_SOME_WAL_FILE + 1).SST, THIS COULD BE AN ISSUE BECAUSE MAYBE WE WENT BACK IN TIME TO BE EARLIER THAN OUR LAST SST THAT WAS SYNCED SO NOW
+        // OUR NEW KEYS SIT BEHIND POTENTIALLY STALE KEYS(IN L0).
+        // SO FIX
         let wal_file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -1280,6 +1284,7 @@ impl FlushingManager {
             Err(e) => WalReplayState::PartialCorrupt(e),
         };
         match replay_state {
+            // repetitive but eventually PartialCorrupt might do extra stuff
             replay_state @ WalReplayState::Clean => Ok(WalToMemtableReplay {
                 memtable,
                 records_recovered,
@@ -1353,19 +1358,18 @@ impl FlushingManager {
         Ok(Some(sstable))
     }
 }
+
+// TODO:
 struct KVEngine {
     // node_id: have a unique ID here
     data_directory: PathBuf, // data_directory now holds all .sst and .wal files
-    // TODO: Need a way to split ssts into levels, L0, L1, L2 ..
-    // Could be done with a manifest file that keeps metadata, but I can just do an easier way for now
-    // PUT SSTable level in the metadata, one byte is enough, also have the levels and sstables in memory as well
-    sstables: Option<Arc<RwLock<Vec<SSTable>>>>,
+    sstables: Option<Arc<RwLock<[Vec<SSTable>; SST_LEVEL_COUNT]>>>, // [vec0(l0), vec1(l1)] .. etc/
     sync_config: SyncConfig,
     wal: WAL,
     frozen_wal: Option<WAL>, // TODO: eventually there can be multiple of these
     memtable: AVL,           // ,multiples here too
     flushing_memtable: Option<Arc<AVL>>, // and here
-    corrupted_files: HashSet<FileId>,
+    corrupted_files: HashSet<PathBuf>,
     flushing_manager: FlushingManager,
     hlc: Arc<Hlc>, // first 52 bits are the time stamp, 12 last bits are the counter
 }
@@ -1427,35 +1431,6 @@ impl Hlc {
             }
         }
     }
-    // pub fn tick(&self) -> u64 {
-    //     // return new HLC
-    //     let curr_tstamp = self.curr_timestamp();
-    //     let mut prev = self.hlc.load(Relaxed);
-    //     loop {
-    //         let hlc_tstamp = prev & MASK_FOR_TSTAMP;
-
-    //         let new = if hlc_tstamp >= curr_tstamp {
-    //             let new_counter = (prev & MASK_FOR_COUNTER) + 1;
-    //             if new_counter > MASK_FOR_COUNTER {
-    //                 // if counter overflows, we add 1 to the timestamp, so we are advancing the physical clock and resetting counter to 0
-    //                 // physical clock starts 12 bits to the left so thats why we add the operation below
-    //                 hlc_tstamp + (MASK_FOR_COUNTER + 1) // Mask is 12 ones, add 1 to get 4096
-    //             } else {
-    //                 hlc_tstamp | new_counter // new counter here is at most 4095 no need to use mask
-    //             }
-    //         } else {
-    //             curr_tstamp
-    //         };
-
-    //         match self
-    //             .hlc
-    //             .compare_exchange_weak(prev, new, Ordering::Relaxed, Ordering::Relaxed)
-    //         {
-    //             Ok(_) => return new,
-    //             Err(x) => prev = x,
-    //         }
-    //     }
-    // }
 
     pub fn deserialize_hlc(hlc: u64) -> (u64, u64) {
         // returns (timestmap, counter)
@@ -1469,7 +1444,8 @@ impl KVEngine {
         // TODO: Put the actual directory somewhere specific not in the working dir
         let path = PathBuf::from(dir_name);
 
-        let mut sstables: Vec<SSTable> = Vec::new();
+        let mut sstables: [Vec<SSTable>; SST_LEVEL_COUNT] = [const { Vec::new() }; SST_LEVEL_COUNT];
+
         let memtable = AVL::new(MEMTABLE_THRESHOLD);
 
         let mut sst_vec: Vec<PathBuf> = Vec::new();
@@ -1513,11 +1489,11 @@ impl KVEngine {
         // This is important because we do not want to call retrieve_wal_records() on the new empty wal
 
         let mut self_instance = Self {
-            sstables: None,
             data_directory: path,
             sync_config,
             memtable,
             flushing_memtable: None,
+            sstables: None,
             wal,
             frozen_wal: None,
             flushing_manager: FlushingManager::new(),
@@ -1527,7 +1503,15 @@ impl KVEngine {
 
         for path in sst_vec {
             match SSTable::load(&path) {
-                Ok(sst) => sstables.push(sst),
+                Ok(sst) => {
+                    if sst.level < SST_LEVEL_COUNT as u8 {
+                        sstables[sst.level as usize].push(sst);
+                    } else {
+                        // probs corrupted
+                        self_instance.corrupted_files.insert(sst.file_path); // Should I store just the path or the entire SST? 
+                        // put in a corrupted vec
+                    }
+                }
                 Err(DbError::DataCorrupted(DataCorruptedErr {
                     reason:
                         CorruptionType::CrcMismatch {
@@ -1545,9 +1529,9 @@ impl KVEngine {
                     // while also building the bloom_filter, sparse_index etc, attach all metadata at the end
                     // then name the rebuilt sstable the same as the sstable with the corrupt metadata so we preserve key recency order
 
-                    // Note: For now I'm just going to treat the sstable as corrupt and the data lost because I need to change
+                    // Note: For now I'm just going to treat the sstable as corrupt and the data 3lost because I need to change
                     // the sparse_index format to be firstkey: offset and have the offset point to the data_block_length in the front of a
-                    // data_block, so we jump to that offset, the first 8 bytes tell us the data_block_length, then we read the data_block
+                    // datea_block, so we jump to that offset, the first 8 bytes tell us the data_block_length, then we read the data_block
                     // compared to what I have now: firstkey: (offset, data_block_length) which means I need the sparse_index to know where
                     // and how long the data_block_length is, meaning if there is a corrupt sparse_index, I cannot rebuild it because
                     // I dont know where data_blocks start or end
@@ -1593,13 +1577,24 @@ impl KVEngine {
                 // WHERE WE WILL REBUILD THE SSTABLE
                 // FOR NOW, IF IT FAILS WE DONT PUSH SST
                 Ok(Some(ss)) => {
-                    sstables.push(ss);
+                    if ss.level < SST_LEVEL_COUNT as u8 {
+                        sstables[ss.level as usize].push(ss);
+                    } else {
+                        // probs corrupted
+                        self_instance.corrupted_files.insert(ss.file_path);
+                        // put in a corrupted vec
+                    }
                 }
                 Err(e) => continue,
                 Ok(None) => continue,
             }
         }
-        sstables.sort_by_key(|p| Reverse(p.id)); // Descending order
+        // TODO MAYBE: Other than L0, all the other levels have no overlapping keys in the sstables
+        // meaning that they could be ordered by min_k, that way a binary search can be done on them instead of linearly checking every sst for the record
+        // good enough for now
+        sstables.iter_mut().for_each(|ss_vec| {
+            ss_vec.sort_by_key(|p| Reverse(p.id)); // Descending order
+        });
 
         self_instance.sstables = Some(Arc::new(RwLock::new(sstables)));
         Ok(self_instance)
@@ -1742,16 +1737,18 @@ impl KVEngine {
     fn search_for_kv_in_sstables(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if let Some(sstables) = &self.sstables {
             // Lock here is held for the entirety of the loop. Ok for now, mostly reads, rare writes
-            for element in sstables.read().unwrap().iter() {
-                match Self::should_search_sstable_file(key, element) {
-                    true => match Self::search_kv_in_sstable(element, key)? {
-                        Found(k) => return Ok(Some(k)),
-                        Deleted => return Ok(None),
-                        Absent => {
-                            continue;
-                        }
-                    },
-                    false => continue,
+            for level in sstables.read().unwrap().iter() {
+                for element in level.iter() {
+                    match Self::should_search_sstable_file(key, element) {
+                        true => match Self::search_kv_in_sstable(element, key)? {
+                            Found(k) => return Ok(Some(k)),
+                            Deleted => return Ok(None),
+                            Absent => {
+                                continue;
+                            }
+                        },
+                        false => continue,
+                    }
                 }
             }
         }
@@ -1839,6 +1836,11 @@ impl KVEngine {
 
         Ok(())
     }
+    fn select_files_for_compaction(&self, level: u8) -> Vec<PathBuf> {
+        if let Some(sstables) = &self.sstables {}
+        //
+        todo!()
+    }
 }
 
 /*Notes:
@@ -1859,8 +1861,8 @@ Bloom filter: k-hash bit array per SSTable to skip files on negative lookups. Us
 // When you read a data block in the sparse index, remember to account for the 4 crc bytes yourself, they are not accounted forin the length
 /*
 
-CHANGE: timestamp now is a u64 which is separated into 2 parts: the upper 52 bits are a timestamp in microseconds, the lower 12 bits are a counter
-// this way it is guaranteed that "time" doesnt drift backwards and will also be useful if/when I add replicas
+
+
 
 
 
@@ -1868,7 +1870,7 @@ CHANGE: timestamp now is a u64 which is separated into 2 parts: the upper 52 bit
  For WAL records, we have deletion and insertion types so far. Will use one byte to define type. 00000100(4) = INSERTION. 00000010(2) = DELETION.
  serialized should look like this: TYPE | RECORD
  WAL RECORD can be tstamp | ksz | key |crc (4 bytes) OR it can be  | tstamp | ksz |vsz | key | value | crc(4 bytes)
- POTENTIAL PROBLEM: should I include sequence numbers for each k/v pair ?
+
  PROBLEM/UPDATE: make Bufreaders with capacity instead
  TODO: Modularize the components into their own files
  TODO.1: Document how things work
