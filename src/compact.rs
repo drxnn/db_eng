@@ -40,9 +40,11 @@ struct CompactionSstSlice {
     file_path: PathBuf,
     sparse_index: Arc<Vec<(Vec<u8>, u64, u64)>>,
     sparse_index_curr_position: usize,
+    level: u8,
 }
 
 struct SstFinalizer {
+    level: u8,
     writer: BufWriter<File>,
     hashed_keys: Vec<u128>,
     sparse_index: SparseIndex,
@@ -54,7 +56,7 @@ struct SstFinalizer {
 }
 
 impl SstFinalizer {
-    fn new(dir: &Path, starting_key: Vec<u8>, hlc: &Hlc) -> Result<Self> {
+    fn new(dir: &Path, starting_key: Vec<u8>, hlc: &Hlc, lvl: u8) -> Result<Self> {
         // PROBLEM: Our OUTPUT Sst file has the newest hlc regardless of the data thats in there,
         // could be old data thats being compacted and now its the newest data
         // Do: just use the highest HLC of the files being compacted into this one
@@ -67,7 +69,7 @@ impl SstFinalizer {
         // in L0, compact every L0 wit every L1 sst
         //
 
-        let (file, tmp_file, final_file) = create_new_data_file(dir, hlc)?;
+        let (file, tmp_file, final_file) = create_new_data_file(dir, hlc.tick())?;
         let writer = BufWriter::new(file);
         Ok(Self {
             writer,
@@ -78,6 +80,7 @@ impl SstFinalizer {
             sst_paths: (tmp_file, final_file),
             offset: 0,
             bytes_written_to_file: 0,
+            level: lvl,
         })
     }
 
@@ -87,11 +90,12 @@ impl SstFinalizer {
 }
 
 impl CompactionSstSlice {
-    fn new(file_path: PathBuf, sparse_index: Arc<Vec<(Vec<u8>, u64, u64)>>) -> Self {
+    fn new(file_path: PathBuf, sparse_index: Arc<Vec<(Vec<u8>, u64, u64)>>, level: u8) -> Self {
         Self {
             file_path,
             sparse_index,
             sparse_index_curr_position: 0,
+            level,
         }
     }
 
@@ -363,24 +367,31 @@ pub struct CompactionOutcome {
     pub final_sst_files: Vec<(PathBuf, PathBuf)>, // (tmp_file, final_file). Tmp holds the data, atomically rename to final
     pub consumed_sst_files: Vec<PathBuf>,         // files that were completely merged
     pub partially_consumed_sst_files: Vec<(PathBuf, DbError)>, // files that were partially merged but then stumbled upon corrupted data
-    pub skipped_sst_files: Vec<(PathBuf, DbError)>, // files were skipped because they threw an error during new(), data is most likely corrupted, main can decide what to do with these depending on the error, maybe the File::open() failed for some reason which doesnt mean data is corrupted
+    pub skipped_sst_files: Vec<(PathBuf, DbError)>,
+    level_for_output_sst: u8, // files were skipped because they threw an error during new(), data is most likely corrupted, main can decide what to do with these depending on the error, maybe the File::open() failed for some reason which doesnt mean data is corrupted
 }
 
 impl CompactionOutcome {
-    pub fn new() -> Self {
+    pub fn new(level_for_output_sst: u8) -> Self {
         Self {
             final_sst_files: Vec::new(),
             consumed_sst_files: Vec::new(),
             partially_consumed_sst_files: Vec::new(),
             skipped_sst_files: Vec::new(),
+            level_for_output_sst,
         }
     }
 }
 
 impl CompactionManager {
     // have main have a select_files_for_compaction function -> Vec<PathBuf>
-    fn new(files: Vec<CompactionSstSlice>, data_dir: PathBuf, hlc: Arc<Hlc>) -> Result<Self> {
-        let mut cmpt_outcome = CompactionOutcome::new();
+    fn new(
+        files: Vec<CompactionSstSlice>,
+        level_for_output_sst: u8,
+        data_dir: PathBuf,
+        hlc: Arc<Hlc>,
+    ) -> Result<Self> {
+        let mut cmpt_outcome = CompactionOutcome::new(level_for_output_sst);
         let (tx, rx) = mpsc::channel::<CompactionThreadResponse>();
         let mut cfe_vec: Vec<CompactionFileElement> = Vec::with_capacity(files.len());
 
@@ -530,6 +541,7 @@ impl CompactionManager {
             &max_k,
             sst_finalizer.sparse_index.index_entries.len() as u64,
             (bloom_filter.bits.len() * 8) as u64,
+            sst_finalizer.level,
         );
         // Repeating myself below with the boundary checks, put in a function
         let footer_crc = compute_crc_data_block(&footer[footer.len() - 41..]);
@@ -576,7 +588,12 @@ impl CompactionManager {
 
         // TODO: THE sst_finalizer below is assigned a new HLC, use the HIGHEST HLC from the input files instead.
         // THE HEAP HAS A NODE FOR EACH FILE INPUT, JUST GRAB THE HLC THATS THE HIGHEST FROM THOSE
-        let mut sst_finalizer = SstFinalizer::new(&data_dir, min_k, &hlc)?;
+        let mut sst_finalizer = SstFinalizer::new(
+            &data_dir,
+            min_k,
+            &hlc,
+            compaction_outcome.level_for_output_sst,
+        )?;
         let mut last_k_written: Option<Vec<u8>> = None;
 
         while let Some(curr_merge_item) = heap.pop().as_mut() {
@@ -586,8 +603,12 @@ impl CompactionManager {
                     let finished_ssts = Self::finalize_output_merged_file(sst_finalizer)?;
 
                     compaction_outcome.final_sst_files.push(finished_ssts);
-                    sst_finalizer =
-                        SstFinalizer::new(&data_dir, curr_merge_item.0.entry.key.clone(), &hlc)?; // after 160MB, one sst is done
+                    sst_finalizer = SstFinalizer::new(
+                        &data_dir,
+                        curr_merge_item.0.entry.key.clone(),
+                        &hlc,
+                        compaction_outcome.level_for_output_sst,
+                    )?; // after 160MB, one sst is done
                 }
 
                 sst_finalizer

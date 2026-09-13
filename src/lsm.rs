@@ -1,8 +1,9 @@
 use crc::{CRC_32_ISO_HDLC, Crc};
+use std::ops::Deref;
 use std::os::unix::fs::FileExt;
 
 use core::num;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions, remove_file};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 
@@ -36,13 +37,18 @@ pub const DATA_BLOCK_MAX_BYTES_SIZE: u64 = 155673; // 8192(max db_size) + KEY_MA
 pub const MAX_SST_SIZE: u64 = 1024 * 1024 * 160;
 const TAG_DELETION: u8 = 2;
 const TAG_INSERTION: u8 = 4;
-pub const SST_LEVEL_COUNT: usize = 7;
+pub const SST_LEVEL_COUNT: usize = 4;
 pub const KEY_MAX_BYTES_SIZE: u64 = 16384;
 pub const VALUE_MAX_BYTES_SIZE: u64 = 131072;
 pub const NUM_OF_BITS_FOR_TSTAMP: u8 = 52;
 pub const NUM_OF_BITS_FOR_COUNTER: u8 = 12;
 pub const MASK_FOR_COUNTER: u64 = (u64::MAX) >> NUM_OF_BITS_FOR_TSTAMP; // 4096
 pub const MASK_FOR_TSTAMP: u64 = (u64::MAX) << NUM_OF_BITS_FOR_COUNTER;
+pub const NUM_OF_L0_FILES_TO_TRIGGER_COMPACTION: usize = 10;
+pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L1_COMPACTION: u64 = MAX_SST_SIZE * 10;
+pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L2_COMPACTION: u64 = MAX_SST_SIZE * 100;
+pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L3_COMPACTION: u64 = MAX_SST_SIZE * 1000;
+pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L4_COMPACTION: u64 = MAX_SST_SIZE * 10000;
 
 // WAL config for flush
 
@@ -189,19 +195,11 @@ impl WAL {
     fn new(
         threshold: u64,
         sync_c: SyncConfig,
-        parent_dir: &PathBuf,
+        parent_dir: &Path,
         curr_hlc: u64,
     ) -> io::Result<WAL> {
         let wal_path = parent_dir.join(format!("{}.wal", curr_hlc));
 
-        //PROBLEM: WALs HLC is at CREATION TIME, HOWEVER WAL CONTAINS RECORDS THAT HAVE A MORE RECENT HLC
-        // WHICH IS AN ISSUE BECAUSE ON REBOOT WHEN WE ARE TRYING TO RECOVER HLC TO BE THE MOST RECENT, WE CHECK ALL THE SSTS HLC(WHICH ARE CREATED AT SYNC TIME=GOOD)
-        // BUT WALS HLCS THAT ARE USED FOR COMPARISONS ARE NOT EXACTLY CORRECT BECAUSE THERE IS RECORDS IN THERE WITH NEWER HLC, SO NEED A WAY TO GET THE MAX_HLC INSIDE THE WAL
-        // SO THAT WE RECOVER TO THE MOST RECENT HLC ON REBOOT AND THERE IS NO TIME DRIFT AT ALL.
-        // IMAGINE: WE RECOVER TO A HLC THAT IS (HLC_OF_SOME_WAL_FILE + 1), THEN WE SYNC THE WAL(WHICH CONTAINS KEYS WITH NEWER HLC THAN THAT) AND WE GIVE THE NEW SST
-        // THE NAME OF (HLC_OF_SOME_WAL_FILE + 1).SST, THIS COULD BE AN ISSUE BECAUSE MAYBE WE WENT BACK IN TIME TO BE EARLIER THAN OUR LAST SST THAT WAS SYNCED SO NOW
-        // OUR NEW KEYS SIT BEHIND POTENTIALLY STALE KEYS(IN L0).
-        // SO FIX
         let wal_file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -816,59 +814,23 @@ impl AVL {
         let root = self.root.take();
         self.root = self.insert(root, node);
     }
-    // fn delete_remove_node(&mut self, curr: Option<Box<Node>>, key: &[u8]) -> Option<Box<Node>> {
-    //     if let Some(mut node) = curr {
-    //         if node.entry.key == key {
-    //             if node.left.is_none() && node.right.is_none() {
-    //                 return None;
-    //             } else if node.right.is_some() != node.left.is_some() {
-    //                 // XOR
-    //                 // return the child
-    //                 if let Some(_x) = node.left.as_ref() {
-    //                     return node.left;
-    //                 } else {
-    //                     return node.right;
-    //                 }
-    //             } else {
-    //                 // safe to unwrap here
-    //                 let (successor, new_right) = Self::take_min(node.right.take().unwrap());
-    //                 {
-    //                     let succ = successor.unwrap();
-    //                     node.right = new_right;
-    //                     node.entry.value = succ.entry.value;
-    //                     node.entry.key = succ.entry.key;
-    //                 }
-    //             }
-    //             return Some(Self::balance(node));
-    //         }
 
-    //         if node.entry.key.as_slice() < key {
-    //             node.right = self.delete_remove_node(node.right.take(), key);
-    //         } else {
-    //             node.left = self.delete_remove_node(node.left.take(), key);
-    //         }
-    //         Some(Self::balance(node))
-    //     } else {
-    //         curr
-    //     }
-    // }
-
-    fn get_min_node(node: &Option<Box<Node>>) -> Option<&Vec<u8>> {
+    fn get_min_node(node: &Option<Box<Node>>) -> Option<&Node> {
         let mut curr = node.as_ref()?;
         while let Some(n) = curr.left.as_ref() {
             curr = n
         }
 
-        Some(&curr.entry.key)
+        Some(curr.as_ref())
     }
-    fn get_max_node(node: &Option<Box<Node>>) -> Option<&Vec<u8>> {
+    fn get_max_node(node: &Option<Box<Node>>) -> Option<&Node> {
         let mut curr = node.as_ref()?;
 
         while let Some(n) = curr.right.as_ref() {
             curr = n
         }
 
-        Some(&curr.entry.key)
+        Some(curr.as_ref()) // 
     }
 
     pub fn serialize_sstable_footer(
@@ -940,14 +902,14 @@ impl AVL {
         Ok(())
     }
 
-    fn sync_avl(&self, dir: &Path, hlc: &Hlc) -> Result<Option<(File, PathBuf, PathBuf)>> {
+    fn sync_avl(&self, dir: &Path, hlc: u64) -> Result<Option<(File, PathBuf, PathBuf)>> {
         let min_k = match Self::get_min_node(&self.root) {
-            Some(k) => k,
+            Some(k) => &k.entry.key,
             None => return Ok(None),
         };
 
         let max_k = match Self::get_max_node(&self.root) {
-            Some(k) => k,
+            Some(k) => &k.entry.key,
             None => return Ok(None),
         };
 
@@ -1037,12 +999,19 @@ impl AVL {
 }
 
 pub enum FlushingThreadResponse {
-    Success(SSTable),
-    Error(DbError),
+    Success { id: u64, sstable: SSTable },
+    Error { id: u64, error: DbError },
+}
+
+struct CompactionJob {
+    // what do I need for a compaction job?
+    primary_file_to_be_compacted: PathBuf,
 }
 struct FlushingManager {
     tx: Sender<FlushingThreadResponse>,
     rx: Receiver<FlushingThreadResponse>,
+    compaction_jobs_queue: VecDeque<CompactionJob>, // TODO, when we are checking the score per level for compaction, we might get multiple scores >= 1
+                                                    // in that case queue the compaction jobs by priority(highest first)
 }
 
 pub enum WalReplayState {
@@ -1054,26 +1023,34 @@ pub struct WalToMemtableReplay {
     memtable: AVL,
     records_recovered: u64,
     valid_bytes: u64,
+    most_recent_hlc: Option<u64>,
     replay_state: WalReplayState,
 }
 
 impl FlushingManager {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel::<FlushingThreadResponse>();
-        Self { tx, rx }
+        Self {
+            tx,
+            rx,
+            compaction_jobs_queue: VecDeque::new(),
+        }
     }
 
     // main will poll and on success, will add the SST to active memory and delete old_wal from directory
     fn background_flush_memtable(
         &mut self,
-        frozen: Arc<AVL>,
+        frozen_instance: FrozenMemtableInstance,
         dir: PathBuf,
-        hlc: Arc<Hlc>,
+        hlc: u64,
     ) -> Result<()> {
         let tx: Sender<FlushingThreadResponse> = self.tx.clone();
 
         spawn(move || -> Result<()> {
-            let (f, ss_path_final) = match frozen.sync_avl(&dir, &hlc) {
+            let (f, ss_path_final) = match frozen_instance
+                .memtable
+                .sync_avl(&dir, frozen_instance.id)
+            {
                 Ok(Some((f, _, ss_path_final))) => {
                     if let Some(dir) = ss_path_final.parent() {
                         // always should have parent
@@ -1085,21 +1062,25 @@ impl FlushingManager {
                 Err(DbError::SyncFail(err, path)) => {
                     // delete the path since sync failed
                     let _ = fs::remove_file(&path);
-                    let _ = tx.send(FlushingThreadResponse::Error(DbError::SyncFail(
-                        Box::new(*err),
-                        path.to_path_buf(),
-                    )));
+                    let _ = tx.send(FlushingThreadResponse::Error {
+                        id: frozen_instance.id,
+                        error: DbError::SyncFail(Box::new(*err), path.to_path_buf()),
+                    });
                     return Err(DbError::ReportedViaChannel);
                 }
                 Err(e) => {
-                    let _ = tx.send(FlushingThreadResponse::Error(e));
+                    let _ = tx.send(FlushingThreadResponse::Error {
+                        id: frozen_instance.id,
+                        error: e,
+                    });
                     return Err(DbError::ReportedViaChannel);
                 }
                 Ok(None) => {
                     // channel should know
-                    let _ = tx.send(FlushingThreadResponse::Error(DbError::MemTableSyncError(
-                        "The memtable returned None".to_string(),
-                    )));
+                    let _ = tx.send(FlushingThreadResponse::Error {
+                        id: frozen_instance.id,
+                        error: DbError::MemTableSyncError("The memtable returned None".to_string()),
+                    });
                     return Err(DbError::ReportedViaChannel); // empty AVL, do nothing
                 }
             };
@@ -1114,7 +1095,10 @@ impl FlushingManager {
                     // MEANS THAT THE WEAK MIGHT ALSO DROP THE MEMTABLE, SO WE CAN HAVE LOSS OF DATA IN THE SPAN OF THIS SEND
                     // TO ITS RECEIVAL, SO JUST USE AN ARC FOR FLUSHING MEMTABLE AS WELL AND JUST DORP IT EXPLICITLY
                     // DONE: JUST REMEMBER TO DROP THE ARC WHEN MAIN RECEIVES THIS
-                    let _ = tx.send(FlushingThreadResponse::Success(sst));
+                    let _ = tx.send(FlushingThreadResponse::Success {
+                        id: frozen_instance.id,
+                        sstable: sst,
+                    });
                 }
                 Err(DbError::DataCorrupted(DataCorruptedErr {
                     reason:
@@ -1130,7 +1114,10 @@ impl FlushingManager {
                 }
                 // SHOULD NOT GET ANY OF THE CRCMISMATCH ERRORS OR FAILURES HERE SINCE WE JUST SYNCED THIS TO FILE CORRECTLY
                 Err(dberr) => {
-                    let _ = tx.send(FlushingThreadResponse::Error(dberr));
+                    let _ = tx.send(FlushingThreadResponse::Error {
+                        id: frozen_instance.id,
+                        error: dberr,
+                    });
                     return Err(DbError::ReportedViaChannel);
                 }
             }
@@ -1145,6 +1132,7 @@ impl FlushingManager {
         let mut memtable = AVL::new(MEMTABLE_THRESHOLD);
         let mut curr_offset: u64 = 0;
         let mut records_recovered = 0;
+        let mut most_recent_hlc: Option<u64> = None;
 
         let wal_f = File::open(path)?;
 
@@ -1200,10 +1188,12 @@ impl FlushingManager {
                         let crc_from_buff = u32::from_le_bytes(crc);
 
                         check_crc(crc_to_check, crc_from_buff, pos, path, CrcType::WalRecord)?;
+                        let ts = u64::from_le_bytes(tstamp);
+                        most_recent_hlc = Some(most_recent_hlc.unwrap_or(0).max(ts));
 
-                        valid_bytes += key_size + 19;
+                        valid_bytes += key_size + 21; // 4 for crc
                         pos = reader.stream_position()?;
-                        memtable.delete(&key_buffer, u64::from_le_bytes(tstamp));
+                        memtable.delete(&key_buffer, ts);
                         records_recovered += 1;
                     }
                     TAG_INSERTION => {
@@ -1253,10 +1243,13 @@ impl FlushingManager {
 
                         check_crc(crc_to_check, crc_from_buff, pos, path, CrcType::WalRecord)?;
 
+                        let ts = u64::from_le_bytes(tstamp);
+                        most_recent_hlc = Some(most_recent_hlc.unwrap_or(0).max(ts));
+
                         valid_bytes += key_size + val_size + 29;
                         pos = reader.stream_position()?;
 
-                        memtable.put(&key_buffer, &val_buffer, u64::from_le_bytes(tstamp));
+                        memtable.put(&key_buffer, &val_buffer, ts);
                         records_recovered += 1;
 
                         // TAG_INSERTION handle tstamp | ksz | vsz | key | value |crc (4 bytes)
@@ -1290,18 +1283,21 @@ impl FlushingManager {
                 records_recovered,
                 valid_bytes,
                 replay_state,
+                most_recent_hlc,
             }),
             replay_state @ WalReplayState::PartialTruncated => Ok(WalToMemtableReplay {
                 memtable,
                 records_recovered,
                 valid_bytes,
                 replay_state,
+                most_recent_hlc,
             }),
             replay_state @ WalReplayState::PartialCorrupt(_) => Ok(WalToMemtableReplay {
                 memtable,
                 records_recovered,
                 valid_bytes,
                 replay_state,
+                most_recent_hlc,
             }),
         }
     }
@@ -1313,14 +1309,26 @@ impl FlushingManager {
         hlc: &Hlc,
     ) -> Result<Option<SSTable>> {
         let memtable = match self.build_avl_from_wal(path) {
-            Ok(replay) => match replay.replay_state {
-                WalReplayState::Clean | WalReplayState::PartialTruncated => replay.memtable,
-                WalReplayState::PartialCorrupt(_) => {
-                    // TODO: caller might want to know that we worked on a corrupt file in the future
-                    // FOR LOGGING PURPOSES ^^
-                    replay.memtable
+            Ok(replay) => {
+                // WE ENSURE OUR CURR HLC IS MORE RECENT THAN THE HIGHEST HLC IN THE WAL
+                if let Some(most_rec_hlc) = replay.most_recent_hlc {
+                    hlc.recover_to(most_rec_hlc);
+                    // if hlc is way ahead of most_rec_hlc, it doesnt recover to it, but this could be an issue because
+                    // then we are assigning the sst below a clock that is way ahead of its most recent record
+                    // which could be an issue if we have multiple WALs with different records, then we lose the correct order because they all get
+                    // a ordering of greater than the current clock, regardless of the records within them
+                    // so it would be better if the wal->sst files get a hlc directly from its most recent record
                 }
-            },
+
+                match replay.replay_state {
+                    WalReplayState::Clean | WalReplayState::PartialTruncated => replay.memtable,
+                    WalReplayState::PartialCorrupt(_) => {
+                        // TODO: caller might want to know that we worked on a corrupt file in the future
+                        // FOR LOGGING PURPOSES ^^
+                        replay.memtable
+                    }
+                }
+            }
 
             Err(e) => {
                 // Didnt retrieve anything
@@ -1328,7 +1336,7 @@ impl FlushingManager {
             }
         };
 
-        let (f, _, ss_final_path) = match memtable.sync_avl(dir, hlc) {
+        let (f, _, ss_final_path) = match memtable.sync_avl(dir, hlc.tick()) {
             Ok(Some((f, tmp_file, ss_final_path))) => {
                 if let Some(dir) = ss_final_path.parent() {
                     // always should have parent
@@ -1359,6 +1367,11 @@ impl FlushingManager {
     }
 }
 
+struct FrozenMemtableInstance {
+    memtable: Arc<AVL>,
+    finished: bool,
+    id: u64, // hlc
+}
 // TODO:
 struct KVEngine {
     // node_id: have a unique ID here
@@ -1367,8 +1380,9 @@ struct KVEngine {
     sync_config: SyncConfig,
     wal: WAL,
     frozen_wal: Option<WAL>, // TODO: eventually there can be multiple of these
-    memtable: AVL,           // ,multiples here too
-    flushing_memtable: Option<Arc<AVL>>, // and here
+    memtable: AVL,
+    frozen_memtables: Option<BTreeMap<u64, FrozenMemtableInstance>>, // ordered. id(hlc) -> mem
+    // frozen_memtable: Option<Arc<AVL>>,                               // and here
     corrupted_files: HashSet<PathBuf>,
     flushing_manager: FlushingManager,
     hlc: Arc<Hlc>, // first 52 bits are the time stamp, 12 last bits are the counter
@@ -1467,6 +1481,9 @@ impl KVEngine {
                     "wal" => {
                         wal_vec.push(path);
                     }
+                    "tmp" => {
+                        let _ = remove_file(path); // unfinished sync
+                    }
                     _ => {}
                 },
                 _ => continue,
@@ -1475,15 +1492,12 @@ impl KVEngine {
 
         let max_hlc_from_ssts = find_max_hlc_between_files(sst_vec.as_slice()).unwrap_or(0);
 
-        let max_hlc_from_wals = find_max_hlc_between_files(wal_vec.as_slice()).unwrap_or(0);
-
-        let max = max_hlc_from_ssts.max(max_hlc_from_wals);
-
-        // find max of hlcs from our wals and ssts here
+        // I have wal_paths, with data that needs to be synced as ssts.
+        //
 
         let hlc = Hlc::new();
 
-        hlc.recover_to(max);
+        hlc.recover_to(max_hlc_from_ssts);
         let wal = WAL::new(MEMTABLE_THRESHOLD, sync_config, &path, hlc.tick())?;
         // IMPORTANT: The new wal is created after we check the actual directory for wal files.
         // This is important because we do not want to call retrieve_wal_records() on the new empty wal
@@ -1492,9 +1506,9 @@ impl KVEngine {
             data_directory: path,
             sync_config,
             memtable,
-            flushing_memtable: None,
             sstables: None,
             wal,
+            frozen_memtables: None,
             frozen_wal: None,
             flushing_manager: FlushingManager::new(),
             corrupted_files: HashSet::new(),
@@ -1756,18 +1770,21 @@ impl KVEngine {
     }
 
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let flushing = self.flushing_memtable.as_ref();
-
         match self.memtable.get(key) {
             Found(bytes) => return Ok(Some(bytes.to_vec())),
             Deleted => return Ok(None),
             Absent => {} // fall through
         }
-        if let Some(frozen_mem) = flushing.as_ref() {
-            match frozen_mem.get(key) {
-                Found(bytes) => return Ok(Some(bytes.to_vec())),
-                Deleted => return Ok(None),
-                Absent => {}
+
+        if let Some(frozen_memtable_collection) = self.frozen_memtables.as_ref() {
+            for (id, mem_table_instance) in frozen_memtable_collection.iter().rev() {
+                // rev() because we search newer memtables first which have a higher id(hlc)
+
+                match mem_table_instance.memtable.get(key) {
+                    Found(bytes) => return Ok(Some(bytes.to_vec())),
+                    Deleted => return Ok(None),
+                    Absent => {}
+                }
             }
         }
 
@@ -1823,23 +1840,109 @@ impl KVEngine {
             AVL::new(MEMTABLE_THRESHOLD),
         ));
 
-        self.flushing_memtable = Some(Arc::clone(&frozen));
+        // PROBLEM: rotation1 starts, we create run this code here, we have flushing_mem and frozen_wal saved
+        // but before rotation1 sync finishes another one starts, replacing our flushing_mem and frozen_wal with the curr ones
+        // meaning we lose the rotation1 flushing mem data for lookup until rotation1 syncing is done.
+        // so use a structure that can hold multiple ordered ones
 
         self.frozen_wal = Some(old_wal);
+        let tick = self.hlc.tick();
 
-        let hlc = Arc::clone(&self.hlc);
+        // WHEN MAIN RECEIVES MESSAGE ABOUT A SUCCESSFUL SST SYNCED, USE SST ID TO REMOVE IT FROM FROZEN COLLECTION
+        // GET METHOD SHOULD FIRST CHECK ACTIVE MEMTABLE, THEN THE COLLECTION OF FROZEN FROM MOST RECENT TO LAST
+        // order: frozen1 -> tick123, frozen2->tick240, frozen3->tick500
+        // most recent is tick500 so the get method should go through them in reverse
+
+        // PROBLEM ^:
+        // if a flush that contains more recent data finished before older flushes ->
+        // it sits as a sst whereas the get() method checks frozen wals first but the newer data sits behind as a sst, serving stale data
+        // figure out a way to not let this happen
+        // If we keep every frozen memtable in memory, thats a lot of space amplification
+        // also depending on load, we could always have frozen AVLS in memory
+        // only remove frozen mem if its older than every other frozen mem ? so older memtables wait for more recent ones
+        // Node(id: 145, AVL, state: unifinished), Node(id: 241, AVL, state: unfinished), Node(id: 13,AVL, state: unfinished), Node(id: 600, AVL, state: finished(is already an sst on disk))
+        // if Node.600 gets removed from memory, we search the other memtables before the SSTS and serve STALE data
+        // fix: on poll, when a Node.id is returned, mark it finished, then have another function check if there is any OLDER data on memtable memory
+        // if yes, we have to wait for all of those to finish to retire Node.600
+        // on poll, run a while loop that gets the first element(dont pop yet), checks if its finished, if yes retire(first element means OLDEST by id) so its okay to retire
+        // also make sure to mark the mem returned as finished before this
+        if let Some(frozen_mems) = self.frozen_memtables.as_mut() {
+            frozen_mems.insert(
+                tick,
+                FrozenMemtableInstance {
+                    finished: false,
+                    memtable: Arc::clone(&frozen),
+                    id: tick,
+                },
+            );
+        }
+
         self.flushing_manager.background_flush_memtable(
-            frozen,
+            FrozenMemtableInstance {
+                finished: false,
+                memtable: Arc::clone(&frozen),
+                id: tick,
+            },
             self.data_directory.clone(),
-            hlc,
+            tick,
         )?;
 
         Ok(())
     }
+
+    fn does_overlap(sstable: &SSTable, min_k: &[u8], max_k: &[u8]) -> bool {
+        if let Some(keys) = sstable.min_max_keys.as_ref() {
+            return (keys.0.as_slice() > min_k && min_k < keys.1.as_slice())
+                || (keys.0.as_slice() < max_k && max_k < keys.1.as_slice());
+        }
+        false
+    }
+
+    // function below should maybe return not only the primary file picked but everything it overlaps with, basically a Vec<PathBuf>
+    fn select_primary_sst_for_compaction(&self, level: u8) -> &SSTable {
+        // finds the best file candidate within a level.
+        // for each file, find all the files it overlaps with in (level+1) and count the bytes of overlap
+        // after counting the bytes, divide by file.size to get a ratio (if we dont divide by size, smaller files will mostly win due to being smaller = less bytes)
+        // the smallest ratio wins to get compacted(this means we have get write amplification to move bytes down a level)
+        // make sure that files that are already schedules for a compaction job are SKIPPED
+        // will merge select_primary_sst_for_compaction and select_files_for_compaction together because I dont need to read the file bytes twice, can do all in one go
+
+        let mut best_candidate: Option<SSTable> = None;
+
+        if let Some(levels) = &self.sstables
+            && let Some(vec) = levels.read().unwrap().get((level) as usize)
+        {
+            for (index, sstable) in vec.iter().enumerate() {
+                // keep curr sstable, and go up a level, find every single file that overlaps, do the math, if better than curr best_candidate, switch
+                if let Some(vector_of_sstables_one_level_up) =
+                    levels.read().unwrap().get((level + 1) as usize)
+                {}
+            }
+        }
+
+        unimplemented!()
+    }
+
     fn select_files_for_compaction(&self, level: u8) -> Vec<PathBuf> {
-        if let Some(sstables) = &self.sstables {}
-        //
-        todo!()
+        let mut sstables_for_compaction: Vec<PathBuf> = Vec::new();
+        if level == 0 {
+            // all L0s with all L1s -> L1
+        }
+
+        let ss = self.select_primary_sst_for_compaction(level);
+        let (min_k, max_k) = ss.min_max_keys.as_ref().unwrap(); // TODO: dont leave tis unwrap here, 
+        // an sst that doesnt have min_k or max_k due to corruption, you can rebuild it by consulting the sparse index
+        // so ensure its always there
+
+        if let Some(sstables) = &self.sstables
+            && let Some(vec) = sstables.read().unwrap().get((level + 1) as usize)
+        {
+            vec.iter().for_each(|sst| {
+                KVEngine::does_overlap(sst, min_k, max_k)
+                    .then(|| sstables_for_compaction.push(sst.file_path.clone()));
+            });
+        }
+        sstables_for_compaction
     }
 }
 
@@ -1878,7 +1981,10 @@ Bloom filter: k-hash bit array per SSTable to skip files on negative lookups. Us
 
 Atomics u64
 
+// TODO: when main receives a successful sync from mebtable -> sst, check if curr number of L0 ssts >= NUM_OF_L0_FILES_TO_TRIGGER_COMPACTION, true -> trigger
+
 TODO: USE read_exact_at from FileExt trait in place of every read_exact call()
+// chekc static vs dynamic level sizing(rocksdb)
 
 // TODO: WRITE TESTS
  //
