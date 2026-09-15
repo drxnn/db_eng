@@ -12,7 +12,7 @@ use std::ptr::null;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::sync::{Weak, mpsc};
 use std::thread::spawn;
 use std::{todo, unimplemented, unreachable};
@@ -1902,15 +1902,8 @@ impl KVEngine {
 
     fn get_min_max_key_range_of_entire_level(
         &self,
-        level: u8,
+        sstables: &Vec<SSTable>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        let Some(levels) = &self.sstables else {
-            return Ok(None);
-        };
-        let levels = levels.read().unwrap();
-        let Some(sstables) = levels.get(level as usize) else {
-            return Ok(None);
-        };
         let mut curr_min_max: Option<(&[u8], &[u8])> = None;
 
         for sstable in sstables {
@@ -1933,18 +1926,18 @@ impl KVEngine {
         Ok(curr_min_max.map(|(min, max)| (min.to_vec(), max.to_vec())))
     }
 
-    fn select_files_for_l0_compaction(&self) -> Result<Option<Vec<PathBuf>>> {
+    fn select_files_for_l0_compaction(
+        &self,
+        levels: &RwLockReadGuard<'_, [Vec<SSTable>; 4]>,
+    ) -> Result<Option<Vec<PathBuf>>> {
         let mut vec_of_overlapping_pathbufs: Vec<PathBuf> = Vec::new();
-        if let Some((min_k, max_k)) = self.get_min_max_key_range_of_entire_level(0)? {
-            let Some(levels) = &self.sstables else {
-                return Ok(None);
-            };
-            let levels = levels.read().unwrap();
+        let ssts_in_level = &levels[0];
+        if let Some((min_k, max_k)) = self.get_min_max_key_range_of_entire_level(ssts_in_level)? {
             let _ = &levels[0]
                 .iter()
                 .for_each(|ss| vec_of_overlapping_pathbufs.push(ss.file_path.clone()));
             // what if L1 is empty?
-            if let Some(vector_of_sstables_one_level_up) = levels.get((1) as usize) {
+            if let Some(vector_of_sstables_one_level_up) = levels.get(1_usize) {
                 vector_of_sstables_one_level_up.iter().for_each(|sst| {
                     KVEngine::does_overlap(sst, min_k.as_slice(), max_k.as_slice()).then(|| {
                         vec_of_overlapping_pathbufs.push(sst.file_path.clone());
@@ -1956,18 +1949,11 @@ impl KVEngine {
         Ok(Some(vec_of_overlapping_pathbufs))
     }
 
-    // TODO: pass the guard to these functions, you do not need to take a RwLockReadGuard 3 times to do one thing and could change
-    // grab levels from a driver function, pass it on to all the functions that need it to determine CompactionJob
-    // function doesnt take L0 into consideration, for that we compact when we pass file count threshold
-    // when should this function be called? every once in a while? when a threshold of any level is reached?
-    fn select_level_for_compaction(&self) -> Result<Option<(f64, u8)>> {
-        let Some(levels) = &self.sstables else {
-            return Ok(None);
-        };
-
+    fn select_level_for_compaction(
+        &self,
+        levels: &RwLockReadGuard<'_, [Vec<SSTable>; 4]>,
+    ) -> Result<Option<(f64, u8)>> {
         let mut best_ratio_candidate: Option<(f64, u8)> = None; // first number is ratio, second is what level
-
-        let levels = levels.read().unwrap();
 
         let l0 = &levels[0];
         let ratio = l0.len() as f64 / NUM_OF_L0_FILES_TO_TRIGGER_COMPACTION as f64;
@@ -2010,59 +1996,86 @@ impl KVEngine {
         Ok(best_ratio_candidate)
     }
 
-    fn select_files_for_compaction(&self, level: u8) -> Result<Option<Vec<PathBuf>>> {
-        if level == 0 {
-            return self.select_files_for_l0_compaction();
-        }
-
+    fn select_files_for_compaction(
+        &self,
+        levels: &RwLockReadGuard<'_, [Vec<SSTable>; 4]>,
+        level: u8,
+    ) -> Result<Option<Vec<PathBuf>>> {
         let mut best_candidate: Option<(u64, &SSTable)> = None; // will be made into a struct later
         let mut files_to_compact: Option<Vec<PathBuf>> = None;
         // first  value is the size of the sum of bytes of all files(a level up) that overlap with SSTable
         // TODO: Remember to mark files picked for compaction
 
-        if let Some(levels) = &self.sstables {
-            let levels = levels.read().unwrap();
-            let Some(curr_level_sstables) = levels.get(level as usize) else {
-                return Ok(None);
-            };
+        if level == 0 {
+            return self.select_files_for_l0_compaction(levels);
+        }
 
-            let Some(vector_of_sstables_one_level_up) = levels.get((level + 1) as usize) else {
-                return Ok(None);
-            };
-            for sstable in curr_level_sstables.iter() {
-                let mut temp_curr_sum_of_file_sizes: u64 = 0;
-                let (min_k, max_k) = sstable.min_max_keys.as_ref().unwrap(); // will fix unwrap
-                // keep curr sstable, and go up a level, find every single file that overlaps, do the math, if better than curr best_candidate, switch
+        let Some(curr_level_sstables) = levels.get(level as usize) else {
+            return Ok(None);
+        };
 
-                let mut vec_of_overlapping_pathbufs: Vec<PathBuf> = Vec::new();
-                vector_of_sstables_one_level_up.iter().for_each(|sst| {
-                    KVEngine::does_overlap(sst, min_k, max_k).then(|| {
-                        // we should also push to the vector of Pathbufs here
-                        vec_of_overlapping_pathbufs.push(sst.file_path.clone());
-                        temp_curr_sum_of_file_sizes += sst.file_size;
-                    });
+        let Some(vector_of_sstables_one_level_up) = levels.get((level + 1) as usize) else {
+            return Ok(None);
+        };
+        for sstable in curr_level_sstables.iter() {
+            let mut temp_curr_sum_of_file_sizes: u64 = 0;
+            let (min_k, max_k) = sstable.min_max_keys.as_ref().unwrap(); // will fix unwrap
+            // keep curr sstable, and go up a level, find every single file that overlaps, do the math, if better than curr best_candidate, switch
+
+            let mut vec_of_overlapping_pathbufs: Vec<PathBuf> = Vec::new();
+            vector_of_sstables_one_level_up.iter().for_each(|sst| {
+                KVEngine::does_overlap(sst, min_k, max_k).then(|| {
+                    // we should also push to the vector of Pathbufs here
+                    vec_of_overlapping_pathbufs.push(sst.file_path.clone());
+                    temp_curr_sum_of_file_sizes += sst.file_size;
                 });
+            });
 
-                match best_candidate {
-                    Some((bytes, sst)) => {
-                        if (bytes as f64 / sst.file_size as f64) // RATIO used to determine candidate, we want the lower ration because theres less write ampl
+            match best_candidate {
+                Some((bytes, sst)) => {
+                    if (bytes as f64 / sst.file_size as f64) // RATIO used to determine candidate, we want the lower ration because theres less write ampl
                             > (temp_curr_sum_of_file_sizes as f64 / sstable.file_size as f64)
-                        {
-                            best_candidate = Some((temp_curr_sum_of_file_sizes, sstable));
-                            vec_of_overlapping_pathbufs.push(sstable.file_path.clone());
-                            files_to_compact = Some(vec_of_overlapping_pathbufs)
-                        }
-                    }
-                    None => {
+                    {
                         best_candidate = Some((temp_curr_sum_of_file_sizes, sstable));
                         vec_of_overlapping_pathbufs.push(sstable.file_path.clone());
                         files_to_compact = Some(vec_of_overlapping_pathbufs)
                     }
                 }
+                None => {
+                    best_candidate = Some((temp_curr_sum_of_file_sizes, sstable));
+                    vec_of_overlapping_pathbufs.push(sstable.file_path.clone());
+                    files_to_compact = Some(vec_of_overlapping_pathbufs)
+                }
             }
         }
 
         Ok(files_to_compact)
+    }
+
+    fn compact(&self) -> Result<Option<()>> {
+        // Todo tomorrow: The compaction manager needs CompactionSstSlices so maybe just build it here since we have ssts
+        // CompactionSstSlice::new(args)
+        // find a way to mark picked sstables atomically
+        // unfinished
+        if let Some(levels) = &self.sstables {
+            let levels = levels.read().unwrap();
+
+            let level = match self.select_level_for_compaction(&levels) {
+                Err(e) => {
+                    todo!()
+                }
+                Ok(Some((ratio, level))) => level,
+                Ok(None) => return Ok(None),
+            };
+
+            let files = match self.select_files_for_compaction(&levels, level) {
+                Ok(Some(files)) => files,
+                Err(e) => return Err(e),
+                Ok(None) => return Ok(None),
+            };
+        }
+
+        Ok(Some(()))
     }
 }
 
