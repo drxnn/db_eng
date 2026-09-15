@@ -8,13 +8,14 @@ use std::fs::{self, File, OpenOptions, remove_file};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 
 use std::path::{Path, PathBuf};
+use std::ptr::null;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, RwLock};
 use std::sync::{Weak, mpsc};
 use std::thread::spawn;
-use std::{todo, unimplemented};
+use std::{todo, unimplemented, unreachable};
 
 use crate::errors::{
     CorruptionType, CrcType, DataCorruptedErr, DbError, InvalidMemtableInput, Result,
@@ -344,6 +345,7 @@ pub struct SSTable {
     bloom_filter: Option<BloomFilter>,
     corrupted: bool,
     level: u8,
+    currently_picked_for_compaction: bool,
 }
 
 impl SSTable {
@@ -519,6 +521,7 @@ impl SSTable {
             bloom_filter,
             corrupted: false,
             level,
+            currently_picked_for_compaction: false,
         })
     }
 
@@ -661,7 +664,7 @@ impl AVL {
             node = Self::balance(node);
             Some(node)
         } else {
-            self.size_in_bytes += n.entry.value.len() as u64 + n.entry.key.len() as u64 + 25; // 25 account for record metadata
+            self.size_in_bytes += n.entry.value.len() as u64 + n.entry.key.len() as u64 + 25; // 25 account for record metadata// TODO: find all usge of numbers and make it a const
             self.size += 1;
             Some(Box::new(n))
         }
@@ -1005,7 +1008,7 @@ pub enum FlushingThreadResponse {
 
 struct CompactionJob {
     // what do I need for a compaction job?
-    primary_file_to_be_compacted: PathBuf,
+    files: Vec<PathBuf>,
 }
 struct FlushingManager {
     tx: Sender<FlushingThreadResponse>,
@@ -1891,58 +1894,175 @@ impl KVEngine {
     }
 
     fn does_overlap(sstable: &SSTable, min_k: &[u8], max_k: &[u8]) -> bool {
-        if let Some(keys) = sstable.min_max_keys.as_ref() {
-            return (keys.0.as_slice() > min_k && min_k < keys.1.as_slice())
-                || (keys.0.as_slice() < max_k && max_k < keys.1.as_slice());
+        if let Some((other_ss_min_k, other_ss_max_k)) = sstable.min_max_keys.as_ref() {
+            return (other_ss_min_k.as_slice() <= max_k && min_k <= other_ss_max_k.as_slice());
         }
         false
     }
 
-    // function below should maybe return not only the primary file picked but everything it overlaps with, basically a Vec<PathBuf>
-    fn select_primary_sst_for_compaction(&self, level: u8) -> &SSTable {
-        // finds the best file candidate within a level.
-        // for each file, find all the files it overlaps with in (level+1) and count the bytes of overlap
-        // after counting the bytes, divide by file.size to get a ratio (if we dont divide by size, smaller files will mostly win due to being smaller = less bytes)
-        // the smallest ratio wins to get compacted(this means we have get write amplification to move bytes down a level)
-        // make sure that files that are already schedules for a compaction job are SKIPPED
-        // will merge select_primary_sst_for_compaction and select_files_for_compaction together because I dont need to read the file bytes twice, can do all in one go
+    fn get_min_max_key_range_of_entire_level(
+        &self,
+        level: u8,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let Some(levels) = &self.sstables else {
+            return Ok(None);
+        };
+        let levels = levels.read().unwrap();
+        let Some(sstables) = levels.get(level as usize) else {
+            return Ok(None);
+        };
+        let mut curr_min_max: Option<(&[u8], &[u8])> = None;
 
-        let mut best_candidate: Option<SSTable> = None;
+        for sstable in sstables {
+            let Some((curr_ss_min, curr_ss_max)) = sstable.min_max_keys.as_ref() else {
+                // jf ss has no min_max_keys(which we should always make sure it does since even if they are corrupted, we can rebuild by consulting the sparse_i)
+                // but in case theres nothing here just return an Error for now
+                return Err(DbError::MissingKey(
+                    "Min-Max keys missing from SStables metadata".to_string(),
+                )); // TODO: fix this error return, its just here so it compiles, either return a correct error or rebuild min max
+            };
 
-        if let Some(levels) = &self.sstables
-            && let Some(vec) = levels.read().unwrap().get((level) as usize)
-        {
-            for (index, sstable) in vec.iter().enumerate() {
-                // keep curr sstable, and go up a level, find every single file that overlaps, do the math, if better than curr best_candidate, switch
-                if let Some(vector_of_sstables_one_level_up) =
-                    levels.read().unwrap().get((level + 1) as usize)
-                {}
+            curr_min_max = match curr_min_max {
+                Some((curr_min, curr_max)) => {
+                    Some((curr_min.min(curr_ss_min), curr_max.max(curr_ss_max)))
+                }
+                None => Some((curr_ss_min, curr_ss_max)),
             }
         }
 
-        unimplemented!()
+        Ok(curr_min_max.map(|(min, max)| (min.to_vec(), max.to_vec())))
     }
 
-    fn select_files_for_compaction(&self, level: u8) -> Vec<PathBuf> {
-        let mut sstables_for_compaction: Vec<PathBuf> = Vec::new();
+    fn select_files_for_l0_compaction(&self) -> Result<Option<Vec<PathBuf>>> {
+        let mut vec_of_overlapping_pathbufs: Vec<PathBuf> = Vec::new();
+        if let Some((min_k, max_k)) = self.get_min_max_key_range_of_entire_level(0)? {
+            let Some(levels) = &self.sstables else {
+                return Ok(None);
+            };
+            let levels = levels.read().unwrap();
+            let _ = &levels[0]
+                .iter()
+                .for_each(|ss| vec_of_overlapping_pathbufs.push(ss.file_path.clone()));
+            // what if L1 is empty?
+            if let Some(vector_of_sstables_one_level_up) = levels.get((1) as usize) {
+                vector_of_sstables_one_level_up.iter().for_each(|sst| {
+                    KVEngine::does_overlap(sst, min_k.as_slice(), max_k.as_slice()).then(|| {
+                        vec_of_overlapping_pathbufs.push(sst.file_path.clone());
+                    });
+                });
+            }
+        }
+
+        Ok(Some(vec_of_overlapping_pathbufs))
+    }
+
+    // TODO: pass the guard to these functions, you do not need to take a RwLockReadGuard 3 times to do one thing and could change
+    // grab levels from a driver function, pass it on to all the functions that need it to determine CompactionJob
+    // function doesnt take L0 into consideration, for that we compact when we pass file count threshold
+    // when should this function be called? every once in a while? when a threshold of any level is reached?
+    fn select_level_for_compaction(&self) -> Result<Option<(f64, u8)>> {
+        let Some(levels) = &self.sstables else {
+            return Ok(None);
+        };
+
+        let mut best_ratio_candidate: Option<(f64, u8)> = None; // first number is ratio, second is what level
+
+        let levels = levels.read().unwrap();
+
+        let l0 = &levels[0];
+        let ratio = l0.len() as f64 / NUM_OF_L0_FILES_TO_TRIGGER_COMPACTION as f64;
+        if ratio >= 1_f64 {
+            best_ratio_candidate = Some((ratio, 0))
+        }
+
+        for level in 1..levels.len() - 1 {
+            let sstables_in_level = &levels[level];
+
+            let bytes_in_entire_level: u64 =
+                sstables_in_level.iter().map(|sst| sst.file_size).sum();
+
+            let target_to_trigger: u64 = MAX_SST_SIZE * 10_u64.pow(level as u32); // corresponds to NUM_OF_BYTES_NEEDED_TO_TRIGGER_L1_COMPACTION et al
+
+            if bytes_in_entire_level < target_to_trigger {
+                continue;
+            };
+
+            let ratio_for_level = bytes_in_entire_level as f64 / target_to_trigger as f64;
+
+            best_ratio_candidate = match best_ratio_candidate {
+                None => {
+                    if ratio_for_level >= 1_f64 {
+                        Some((ratio_for_level, level as u8))
+                    } else {
+                        None
+                    }
+                }
+                curr @ Some((curr_ratio, _)) => {
+                    if curr_ratio < ratio_for_level {
+                        Some((ratio_for_level, level as u8))
+                    } else {
+                        curr
+                    }
+                }
+            }
+        }
+
+        Ok(best_ratio_candidate)
+    }
+
+    fn select_files_for_compaction(&self, level: u8) -> Result<Option<Vec<PathBuf>>> {
         if level == 0 {
-            // all L0s with all L1s -> L1
+            return self.select_files_for_l0_compaction();
         }
 
-        let ss = self.select_primary_sst_for_compaction(level);
-        let (min_k, max_k) = ss.min_max_keys.as_ref().unwrap(); // TODO: dont leave tis unwrap here, 
-        // an sst that doesnt have min_k or max_k due to corruption, you can rebuild it by consulting the sparse index
-        // so ensure its always there
+        let mut best_candidate: Option<(u64, &SSTable)> = None; // will be made into a struct later
+        let mut files_to_compact: Option<Vec<PathBuf>> = None;
+        // first  value is the size of the sum of bytes of all files(a level up) that overlap with SSTable
+        // TODO: Remember to mark files picked for compaction
 
-        if let Some(sstables) = &self.sstables
-            && let Some(vec) = sstables.read().unwrap().get((level + 1) as usize)
-        {
-            vec.iter().for_each(|sst| {
-                KVEngine::does_overlap(sst, min_k, max_k)
-                    .then(|| sstables_for_compaction.push(sst.file_path.clone()));
-            });
+        if let Some(levels) = &self.sstables {
+            let levels = levels.read().unwrap();
+            let Some(curr_level_sstables) = levels.get(level as usize) else {
+                return Ok(None);
+            };
+
+            let Some(vector_of_sstables_one_level_up) = levels.get((level + 1) as usize) else {
+                return Ok(None);
+            };
+            for sstable in curr_level_sstables.iter() {
+                let mut temp_curr_sum_of_file_sizes: u64 = 0;
+                let (min_k, max_k) = sstable.min_max_keys.as_ref().unwrap(); // will fix unwrap
+                // keep curr sstable, and go up a level, find every single file that overlaps, do the math, if better than curr best_candidate, switch
+
+                let mut vec_of_overlapping_pathbufs: Vec<PathBuf> = Vec::new();
+                vector_of_sstables_one_level_up.iter().for_each(|sst| {
+                    KVEngine::does_overlap(sst, min_k, max_k).then(|| {
+                        // we should also push to the vector of Pathbufs here
+                        vec_of_overlapping_pathbufs.push(sst.file_path.clone());
+                        temp_curr_sum_of_file_sizes += sst.file_size;
+                    });
+                });
+
+                match best_candidate {
+                    Some((bytes, sst)) => {
+                        if (bytes as f64 / sst.file_size as f64) // RATIO used to determine candidate, we want the lower ration because theres less write ampl
+                            > (temp_curr_sum_of_file_sizes as f64 / sstable.file_size as f64)
+                        {
+                            best_candidate = Some((temp_curr_sum_of_file_sizes, sstable));
+                            vec_of_overlapping_pathbufs.push(sstable.file_path.clone());
+                            files_to_compact = Some(vec_of_overlapping_pathbufs)
+                        }
+                    }
+                    None => {
+                        best_candidate = Some((temp_curr_sum_of_file_sizes, sstable));
+                        vec_of_overlapping_pathbufs.push(sstable.file_path.clone());
+                        files_to_compact = Some(vec_of_overlapping_pathbufs)
+                    }
+                }
+            }
         }
-        sstables_for_compaction
+
+        Ok(files_to_compact)
     }
 }
 
