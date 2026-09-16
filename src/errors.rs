@@ -77,10 +77,12 @@ pub enum DbError {
     MemTableSyncError(String),
     ReportedViaChannel,
     SyncFail(Box<DbError>, PathBuf),
+    WalFailed,
     CompactionError(CompactionErr),
     DataBlockExhausted,
     TooManyFilesOpenInProcess,
     TooManyFilesOpenInSystem,
+    MalformedDataBlock(String),
     WalNotFound,
     NonNumericFileIdOnSstable(PathBuf),
     InvalidSstableFileName(PathBuf),
@@ -120,6 +122,7 @@ impl From<io::Error> for DbError {
 pub enum CompactionErr {
     HeapNotFound,
     EmptyCompactionFileElementCollection,
+    CompactionJobAlreadyInFlight,
 }
 
 pub enum FlushingError {
@@ -230,6 +233,12 @@ impl fmt::Display for DbError {
                 CompactionErr::HeapNotFound => {
                     write!(f, "Empty Heap during compaction. ")
                 }
+                CompactionErr::CompactionJobAlreadyInFlight => {
+                    write!(
+                        f,
+                        "Couldn't start CompactionJob. There is one already running"
+                    )
+                }
             },
             Self::DataBlockExhausted => {
                 write!(f, "Datablock exhausted. Unfinished. ")
@@ -286,6 +295,12 @@ impl fmt::Display for DbError {
                     p.display(),
                     e
                 )
+            }
+            Self::MalformedDataBlock(s) => {
+                write!(f, "MalformedDataBlock. ErrMsg:{}", s)
+            }
+            Self::WalFailed => {
+                write!(f, "Wal Failure.")
             }
         }
     }

@@ -1,26 +1,24 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self};
 
-use std::io::ErrorKind::UnexpectedEof;
 use std::io::{Seek, SeekFrom, Write};
 
 use std::path::Path;
 use std::sync::Arc;
-use std::thread::spawn;
+use std::thread::{JoinHandle, spawn};
 
 use std::mem;
 use std::{
     fs::File,
-    io::{BufReader, BufWriter, Read},
+    io::{BufReader, BufWriter},
     path::PathBuf,
-    sync::mpsc::{self, Receiver, Sender},
 };
 
 use crc::{CRC_32_ISO_HDLC, Crc};
 
-use crate::errors::CompactionErr::{self, HeapNotFound};
+use crate::errors::CompactionErr::{self};
 
 use crate::errors::CrcType;
 use crate::helpers::{
@@ -32,11 +30,11 @@ use crate::lsm::{
 };
 use crate::{
     errors::{DataCorruptedErr, DbError, Result},
-    lsm::{KEY_MAX_BYTES_SIZE, SSTable, VALUE_MAX_BYTES_SIZE},
+    lsm::{KEY_MAX_BYTES_SIZE, VALUE_MAX_BYTES_SIZE},
 };
 
 //Comes from SSTable struct
-struct CompactionSstSlice {
+pub struct CompactionSstSlice {
     file_path: PathBuf,
     sparse_index: Arc<Vec<(Vec<u8>, u64, u64)>>,
     sparse_index_curr_position: usize,
@@ -62,7 +60,7 @@ impl SstFinalizer {
         // Do: just use the highest HLC of the files being compacted into this one
         // The Hlc of the SST is calculated at the time of flushing which means the Hlc is > than the biggest Hlc of the max key in the sst
         // Bigger Hlc == more recent
-        // we are also going up a level so we need to make sure the key range in the newly compacted sst is correctly ordered with the other sst files in that levle
+        // we are also going up a level so we need to make sure the key range in the newly compacted sst is correctly ordered with the other sst files in that level
         // ALSO TODO: Add another metadata byte in the ssts, Level:
         // File picker for compaction: pick one file in L_n, then find all the overlapping ssts in L_(n+1) and compact all of these together.
         // output gets placed in L(n+1)
@@ -90,7 +88,7 @@ impl SstFinalizer {
 }
 
 impl CompactionSstSlice {
-    fn new(file_path: PathBuf, sparse_index: Arc<Vec<(Vec<u8>, u64, u64)>>, level: u8) -> Self {
+    pub fn new(file_path: PathBuf, sparse_index: Arc<Vec<(Vec<u8>, u64, u64)>>, level: u8) -> Self {
         Self {
             file_path,
             sparse_index,
@@ -352,23 +350,65 @@ impl CompactionFileElement {
     }
 }
 
-struct CompactionManager {
-    tx: Sender<CompactionThreadResponse>,
-    rx: Receiver<CompactionThreadResponse>,
-    file_handles: Option<Vec<CompactionFileElement>>,
-    heap: Option<BinaryHeap<Reverse<MergeItem>>>,
-    compaction_outcome: Option<CompactionOutcome>,
+pub struct CompactionManager {
+    // if theres a compaction currently running while we have another one just add to queue,
+    // then remove from queue when compaction is done // pop
+    running_job: Option<JoinHandle<CompactionOutcome>>,
+}
+
+impl CompactionManager {
+    pub fn new() -> Self {
+        CompactionManager { running_job: None }
+    }
+
+    pub fn start(&mut self, job: CompactionJob) -> Result<()> {
+        // returns CompactionOutcome
+        if self.running_job.is_none() {
+            self.running_job = Some(spawn(move || job.run()));
+            Ok(())
+        } else {
+            Err(DbError::CompactionError(
+                CompactionErr::CompactionJobAlreadyInFlight,
+            ))
+        }
+        // we can have main run a poll function that
+        // takes the join handle, checks is_finished(doesnt block), if yes we join it, if not we put it back
+    }
+    pub fn is_busy(&self) -> bool {
+        self.running_job.is_some()
+    }
+
+    pub fn poll(&mut self) -> Option<CompactionOutcome> {
+        let handle = self.running_job.take()?;
+        if !handle.is_finished() {
+            self.running_job = Some(handle);
+            return None;
+        }
+
+        match handle.join() {
+            Ok(cmpt_outcome) => Some(cmpt_outcome),
+            Err(e) => None, // what would be done here?
+        }
+    }
+}
+pub struct CompactionJob {
+    files: Vec<CompactionSstSlice>,
     data_dir: PathBuf,
     hlc: Arc<Hlc>,
+    level_for_output_sst: u8,
 }
+
 #[derive(Default)]
 pub struct CompactionOutcome {
-    // TODO final_sst_files just needs the final, why do we have tmp? when we have a final_sst just unlink tmp
-    pub final_sst_files: Vec<(PathBuf, PathBuf)>, // (tmp_file, final_file). Tmp holds the data, atomically rename to final
-    pub consumed_sst_files: Vec<PathBuf>,         // files that were completely merged
+    pub final_sst_files: Vec<(PathBuf, PathBuf)>, // (tmp_file, final_file). Tmp holds the data, atomically rename to final, tmp is necessary in case of an error during cmpt
+
+    pub consumed_sst_files: Vec<PathBuf>, // files that were completely merged
+    // TODO: should I accept partially merged files? there would be data loss and if its l0, we can serve bad data
+    // reject entire job if this happens?
     pub partially_consumed_sst_files: Vec<(PathBuf, DbError)>, // files that were partially merged but then stumbled upon corrupted data
     pub skipped_sst_files: Vec<(PathBuf, DbError)>,
     level_for_output_sst: u8, // files were skipped because they threw an error during new(), data is most likely corrupted, main can decide what to do with these depending on the error, maybe the File::open() failed for some reason which doesnt mean data is corrupted
+    pub compaction_err: Option<DbError>,
 }
 
 impl CompactionOutcome {
@@ -379,20 +419,34 @@ impl CompactionOutcome {
             partially_consumed_sst_files: Vec::new(),
             skipped_sst_files: Vec::new(),
             level_for_output_sst,
+            compaction_err: None,
         }
     }
 }
 
-impl CompactionManager {
-    // have main have a select_files_for_compaction function -> Vec<PathBuf>
-    fn new(
+impl CompactionJob {
+    pub fn new(
         files: Vec<CompactionSstSlice>,
         level_for_output_sst: u8,
         data_dir: PathBuf,
         hlc: Arc<Hlc>,
-    ) -> Result<Self> {
+    ) -> Self {
+        Self {
+            files,
+            data_dir,
+            hlc,
+            level_for_output_sst,
+        }
+    }
+
+    fn run(self) -> CompactionOutcome {
+        let CompactionJob {
+            files,
+            data_dir,
+            hlc,
+            level_for_output_sst,
+        } = self;
         let mut cmpt_outcome = CompactionOutcome::new(level_for_output_sst);
-        let (tx, rx) = mpsc::channel::<CompactionThreadResponse>();
         let mut cfe_vec: Vec<CompactionFileElement> = Vec::with_capacity(files.len());
 
         let mut heap: BinaryHeap<Reverse<MergeItem>> = BinaryHeap::with_capacity(files.len());
@@ -427,92 +481,18 @@ impl CompactionManager {
 
             cfe_vec.push(cfe);
         }
-
-        Ok(Self {
-            tx,
-            rx,
-            file_handles: Some(cfe_vec),
-            heap: Some(heap),
-            compaction_outcome: Some(cmpt_outcome),
-            data_dir,
-            hlc,
-        })
-    }
-
-    fn background_compact(&mut self) -> Result<()> {
-        let tx: Sender<CompactionThreadResponse> = self.tx.clone();
-
-        // TODO: dont pass sst paths, have merge_to_final open the files and if it exceeds MAX_SST_SIZE, then open a new sst file and continue merging the inputs therex
-
-        // this error should actually never happen, heap gets built during new() and if new returns, it will always be populated
-        let hlc = Arc::clone(&self.hlc);
-        let Some(heap) = self.heap.take() else {
-            let _ = tx.send(CompactionThreadResponse::Error(DbError::CompactionError(
-                HeapNotFound,
-            )));
-            return Err(DbError::CompactionError(HeapNotFound));
-        };
-
         // same as above, should not happen
-        let Some(mut cfe_vec) = self.file_handles.take() else {
-            let _ = tx.send(CompactionThreadResponse::Error(DbError::CompactionError(
-                CompactionErr::EmptyCompactionFileElementCollection,
-            )));
-            return Err(DbError::CompactionError(
-                CompactionErr::EmptyCompactionFileElementCollection,
-            ));
-        };
-        let cmpt_outcome = self.compaction_outcome.take().unwrap_or_default();
 
-        let data_directory = self.data_dir.clone();
-
-        spawn(move || -> Result<()> {
-            let compaction_result = (|| -> Result<CompactionOutcome> {
-                let cmpt = CompactionManager::merge_to_final(
-                    cmpt_outcome,
-                    heap,
-                    &mut cfe_vec,
-                    data_directory,
-                    hlc,
-                )?;
-
-                cmpt.final_sst_files.iter().try_for_each(
-                    |sst_paths: &(PathBuf, PathBuf)| -> Result<()> {
-                        fs::rename(&sst_paths.0, &sst_paths.1)?;
-                        if let Some(dir) = sst_paths.1.parent() {
-                            File::open(dir)?.sync_all()?;
-                        };
-                        // let sst = SSTable::load(&sst_paths.1)?; // should I load the ssts here or let main do it from the paths?
-                        // let MAIN DO IT
-
-                        Ok(())
-                    },
-                )?;
-
-                Ok(cmpt)
-            })();
-
-            match compaction_result {
-                Ok(cmpt) => {
-                    let _ = tx.send(CompactionThreadResponse::Success(cmpt));
-                }
-                Err(e) => {
-                    // LOOP HERE and remove files
-                    // OR should I have a separate successful_sst_outputs where merge_to_final does the atomic rename itself and then here we can only get rid of incomplete ones
-                    // Problem: there are a lot of different errors that can be returned by compaction_result (or merge_to_final inside compaction_result), it would be better to anticipate every single one(or important failures) and decide what to do depending on that
-                    // let _ = fs::remove_file(&sst_paths.1);
-                    // let _ = fs::remove_file(&sst_paths.2);
-                    let _ = tx.send(CompactionThreadResponse::Error(e));
-                }
+        match CompactionJob::merge_to_final(&mut cmpt_outcome, heap, &mut cfe_vec, data_dir, hlc) {
+            Ok(()) => cmpt_outcome,
+            Err(e) => {
+                cmpt_outcome.compaction_err = Some(e);
+                cmpt_outcome
             }
-
-            Ok(())
-        });
-
-        Ok(())
+        }
     }
 
-    fn finalize_output_merged_file(mut sst_finalizer: SstFinalizer) -> Result<(PathBuf, PathBuf)> {
+    fn finalize_output_merged_file(mut sst_finalizer: SstFinalizer) -> Result<(())> {
         // return final.sst
 
         let len = sst_finalizer.data_block.bytes.get_ref().len() as u64;
@@ -568,47 +548,50 @@ impl CompactionManager {
         sst_finalizer.writer.flush()?;
         sst_finalizer.writer.get_mut().sync_all()?;
 
-        Ok((sst_finalizer.sst_paths.0, sst_finalizer.sst_paths.1))
+        Ok(())
     }
 
     fn merge_to_final(
-        mut compaction_outcome: CompactionOutcome,
+        compaction_outcome: &mut CompactionOutcome,
         mut heap: BinaryHeap<Reverse<MergeItem>>,
         cfe_vec: &mut [CompactionFileElement],
         data_dir: PathBuf,
         hlc: Arc<Hlc>,
-    ) -> Result<CompactionOutcome> {
-        let min_k = heap
-            .peek()
-            .ok_or(DbError::DataBlockExhausted)? // TODO HERE: Either return a better specific error or just return a Ok(None) meaning nothing to do
-            .0
-            .entry
-            .key
-            .clone(); // grab min key before we start
+    ) -> Result<()> {
+        // grab min key before we start
+        let Some(first) = heap.peek() else {
+            return Ok(());
+        }; // nothing to comoact
+        let min_k = first.0.entry.key.clone();
 
         // TODO: THE sst_finalizer below is assigned a new HLC, use the HIGHEST HLC from the input files instead.
-        // THE HEAP HAS A NODE FOR EACH FILE INPUT, JUST GRAB THE HLC THATS THE HIGHEST FROM THOSE
         let mut sst_finalizer = SstFinalizer::new(
             &data_dir,
             min_k,
             &hlc,
             compaction_outcome.level_for_output_sst,
         )?;
+        compaction_outcome
+            .final_sst_files
+            .push(sst_finalizer.sst_paths.clone());
         let mut last_k_written: Option<Vec<u8>> = None;
 
         while let Some(curr_merge_item) = heap.pop().as_mut() {
             if last_k_written.as_ref() != Some(&curr_merge_item.0.entry.key) {
                 let record = curr_merge_item.0.serialize_record()?;
                 if sst_finalizer.would_exceed_max_sst_size(record.len() as u64) {
-                    let finished_ssts = Self::finalize_output_merged_file(sst_finalizer)?;
+                    Self::finalize_output_merged_file(sst_finalizer)?;
 
-                    compaction_outcome.final_sst_files.push(finished_ssts);
                     sst_finalizer = SstFinalizer::new(
                         &data_dir,
                         curr_merge_item.0.entry.key.clone(),
                         &hlc,
                         compaction_outcome.level_for_output_sst,
-                    )?; // after 160MB, one sst is done
+                    )?; // after 160MB, one sst is done // 
+                    compaction_outcome
+                        .final_sst_files
+                        .push(sst_finalizer.sst_paths.clone());
+                    // TODO: if this ? throws, we have to take care of the finished_ssts in the Error case on the caller
                 }
 
                 sst_finalizer
@@ -668,16 +651,14 @@ impl CompactionManager {
                 });
         }
 
-        // use herre Self::finalize_output_merged_file(sst_finalizer)
-        let sst_paths = Self::finalize_output_merged_file(sst_finalizer)?;
+        Self::finalize_output_merged_file(sst_finalizer)?;
         // put paths into vec
-        compaction_outcome.final_sst_files.push(sst_paths);
+        // compaction_outcome.final_sst_files.push(sst_paths);
 
-        Ok(compaction_outcome)
+        Ok(())
     }
 }
 
-//TODO Ordering needs to be updated after HLC is implementd
 impl Ord for MergeItem {
     fn cmp(&self, other: &Self) -> Ordering {
         let (tstamp_other, counter_other) = Hlc::deserialize_hlc(other.entry.timestamp);

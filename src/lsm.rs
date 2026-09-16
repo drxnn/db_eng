@@ -17,6 +17,8 @@ use std::sync::{Weak, mpsc};
 use std::thread::spawn;
 use std::{todo, unimplemented, unreachable};
 
+use crate::compact::{CompactionJob, CompactionManager, CompactionOutcome, CompactionSstSlice};
+use crate::errors::CorruptionType::Other;
 use crate::errors::{
     CorruptionType, CrcType, DataCorruptedErr, DbError, InvalidMemtableInput, Result,
 };
@@ -290,47 +292,60 @@ impl SsTableDataBlock {
     }
 
     pub fn grab_min_key_from_data_block(&mut self) -> Result<Vec<u8>> {
-        let mut tstamp = [0u8; 8];
-        let mut ksz = [0u8; 8];
-        let mut vsz = [0u8; 8];
-        let mut tombstone: [u8; 1] = [0u8; 1];
+        let mut pos = 8; // skip timestamp
 
-        self.bytes.read_exact(&mut tstamp)?;
-        self.bytes.read_exact(&mut ksz)?;
-        self.bytes.read_exact(&mut vsz)?;
-        self.bytes.read_exact(&mut tombstone)?;
-        let k_size = u64::from_le_bytes(ksz);
-        let v_size = u64::from_le_bytes(vsz);
-        let mut key = vec![0u8; k_size as usize];
-        let mut value = vec![0u8; v_size as usize];
-        self.bytes.read_exact(&mut key)?;
-        self.bytes.read_exact(&mut value)?;
-        self.bytes.set_position(0);
+        let ksz = u64::from_le_bytes(
+            read_range(self.bytes.get_ref(), pos, pos + 8)?
+                .try_into()
+                .unwrap(),
+        );
+        pos += 8;
+        pos += 8;
+        pos += 1;
+        let key = read_range(self.bytes.get_ref(), pos, pos + ksz as usize)?;
+
         Ok(key.to_vec())
     }
     pub fn grab_max_key_from_data_block(&mut self) -> Result<Vec<u8>> {
-        let mut tstamp = [0u8; 8];
-        let mut ksz = [0u8; 8];
-        let mut vsz = [0u8; 8];
-        let mut tombstone: [u8; 1] = [0u8; 1];
-        let mut curr_max: Vec<u8> = vec![]; // function only gets called when there is a data block so it should never return this
+        let mut pos = 0;
 
-        while self.bytes.read_exact(&mut tstamp).is_ok() {
+        let mut curr_max: Option<&[u8]> = None; // put in some then unwrap at the end or err
+
+        while pos < self.size {
             // when it throws eof, we have reached the end
-            self.bytes.read_exact(&mut ksz)?;
-            self.bytes.read_exact(&mut vsz)?;
-            self.bytes.read_exact(&mut tombstone)?;
-            let k_size = u64::from_le_bytes(ksz);
-            let v_size = u64::from_le_bytes(vsz);
-            let mut key = vec![0u8; k_size as usize];
-            let mut value = vec![0u8; v_size as usize];
-            self.bytes.read_exact(&mut key)?;
-            self.bytes.read_exact(&mut value)?;
-            curr_max = key.to_vec();
+            pos += 8; // skip tstamp
+            let k_size = u64::from_le_bytes(
+                read_range(self.bytes.get_ref(), pos, pos + 8)?
+                    .try_into()
+                    .unwrap(),
+            );
+            pos += 8;
+            let v_size = u64::from_le_bytes(
+                read_range(self.bytes.get_ref(), pos, pos + 8)?
+                    .try_into()
+                    .unwrap(),
+            );
+            pos += 8;
+            pos += 1;
+
+            let key = read_range(self.bytes.get_ref(), pos, pos + k_size as usize)?;
+            pos += k_size as usize;
+            pos += v_size as usize;
+            curr_max = Some(key);
         }
 
-        self.bytes.set_position(0);
-        Ok(curr_max)
+        if pos != self.size {
+            return Err(DbError::MalformedDataBlock(
+                "last record runs past end of block".to_string(),
+            ));
+        }
+        let Some(max_k) = curr_max else {
+            return Err(DbError::MalformedDataBlock(
+                "Max key is missing from SsTableDataBlock".to_string(),
+            ));
+        };
+
+        Ok(max_k.to_vec())
     }
 }
 
@@ -511,7 +526,7 @@ impl SSTable {
 
         let parsed_sparse_index =
             SparseIndex::parse_sparse_index(sparse_index, path.to_path_buf())?; // catch err from caller
-        Ok(SSTable {
+        let mut sstable = SSTable {
             id,
             file: f,
             file_path: path.to_path_buf(),
@@ -522,7 +537,11 @@ impl SSTable {
             corrupted: false,
             level,
             currently_picked_for_compaction: false,
-        })
+        };
+        if sstable.min_max_keys.is_none() {
+            sstable.rebuild_min_max_key_from_sparse_index()?;
+        }
+        Ok(sstable)
     }
 
     fn binary_search_sparse_index(&self, key: &[u8]) -> Option<(u64, u64)> {
@@ -554,6 +573,77 @@ impl SSTable {
         }
 
         best_candidate
+    }
+
+    fn rebuild_min_max_key_from_sparse_index(&mut self) -> Result<()> {
+        //[ tstamp(8) | ksz(8) | value_sz(8) | tombstone | key | value |  ] ... crc(4) (crc for the entire datablock);
+
+        let (Some((min_k, _, _)), Some((_, last_sparse_offset, last_data_block_length))) =
+            (self.sparse_index.first(), self.sparse_index.last())
+        else {
+            return Err(DbError::DataCorrupted(DataCorruptedErr {
+                offset: 0,
+                file_path: self.file_path.to_path_buf(),
+                reason: Other("empty sparse index, cannot rebuild min/max keys".to_string()),
+            }));
+        };
+
+        let f = &mut self.file;
+
+        let mut data_block_buffer_and_crc = vec![0u8; (*last_data_block_length + 4) as usize]; // 4 for the crc
+        f.read_exact_at(&mut data_block_buffer_and_crc, *last_sparse_offset)?;
+        let data_block_buffer = &data_block_buffer_and_crc[..(*last_data_block_length as usize)];
+
+        let crc = &data_block_buffer_and_crc[(*last_data_block_length as usize)..];
+
+        check_crc(
+            compute_crc_data_block(data_block_buffer),
+            u32::from_le_bytes(crc.try_into().unwrap()),
+            *last_sparse_offset,
+            &self.file_path,
+            CrcType::DataBlock,
+        )?;
+
+        let mut max_k: Option<&[u8]> = None;
+        let mut pos = 0;
+
+        while pos < *last_data_block_length {
+            pos += 8; // skip tstamp
+            let ksz = u64::from_le_bytes(
+                read_range(data_block_buffer, pos as usize, (pos + 8) as usize)?
+                    .try_into()
+                    .unwrap(),
+            );
+            pos += 8;
+            let vsz = u64::from_le_bytes(
+                read_range(data_block_buffer, pos as usize, (pos + 8) as usize)?
+                    .try_into()
+                    .unwrap(),
+            );
+            pos += 8;
+            pos += 1; // skip tombstone
+            max_k = Some(read_range(
+                data_block_buffer,
+                pos as usize,
+                (pos + ksz) as usize,
+            )?);
+
+            pos += ksz + vsz; // skip val
+        }
+
+        if pos != data_block_buffer.len() as u64 {
+            return Err(DbError::MalformedDataBlock(
+                "last record runs past end of block".to_string(),
+            ));
+        }
+        let Some(max_k) = max_k else {
+            return Err(DbError::MalformedDataBlock(
+                "SsTableDataBlock is empty".to_string(),
+            ));
+        };
+        self.min_max_keys = Some((min_k.to_vec(), max_k.to_vec()));
+
+        Ok(())
     }
 }
 pub struct AVL {
@@ -1006,15 +1096,9 @@ pub enum FlushingThreadResponse {
     Error { id: u64, error: DbError },
 }
 
-struct CompactionJob {
-    // what do I need for a compaction job?
-    files: Vec<PathBuf>,
-}
 struct FlushingManager {
     tx: Sender<FlushingThreadResponse>,
     rx: Receiver<FlushingThreadResponse>,
-    compaction_jobs_queue: VecDeque<CompactionJob>, // TODO, when we are checking the score per level for compaction, we might get multiple scores >= 1
-                                                    // in that case queue the compaction jobs by priority(highest first)
 }
 
 pub enum WalReplayState {
@@ -1033,11 +1117,7 @@ pub struct WalToMemtableReplay {
 impl FlushingManager {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel::<FlushingThreadResponse>();
-        Self {
-            tx,
-            rx,
-            compaction_jobs_queue: VecDeque::new(),
-        }
+        Self { tx, rx }
     }
 
     // main will poll and on success, will add the SST to active memory and delete old_wal from directory
@@ -1384,11 +1464,13 @@ struct KVEngine {
     wal: WAL,
     frozen_wal: Option<WAL>, // TODO: eventually there can be multiple of these
     memtable: AVL,
-    frozen_memtables: Option<BTreeMap<u64, FrozenMemtableInstance>>, // ordered. id(hlc) -> mem
+    frozen_memtables: BTreeMap<u64, FrozenMemtableInstance>, // ordered. id(hlc) -> mem
     // frozen_memtable: Option<Arc<AVL>>,                               // and here
     corrupted_files: HashSet<PathBuf>,
     flushing_manager: FlushingManager,
     hlc: Arc<Hlc>, // first 52 bits are the time stamp, 12 last bits are the counter
+    compaction_manager: CompactionManager,
+    wal_failed: bool,
 }
 
 pub struct Hlc {
@@ -1511,11 +1593,13 @@ impl KVEngine {
             memtable,
             sstables: None,
             wal,
-            frozen_memtables: None,
+            frozen_memtables: BTreeMap::new(),
             frozen_wal: None,
             flushing_manager: FlushingManager::new(),
             corrupted_files: HashSet::new(),
             hlc: Arc::new(hlc),
+            compaction_manager: CompactionManager::new(),
+            wal_failed: false,
         };
 
         for path in sst_vec {
@@ -1529,16 +1613,18 @@ impl KVEngine {
                         // put in a corrupted vec
                     }
                 }
-                Err(DbError::DataCorrupted(DataCorruptedErr {
-                    reason:
-                        CorruptionType::CrcMismatch {
-                            mismatch_type: CrcType::SparseIndex,
-                            ..
-                        }
-                        | CorruptionType::MetaDataSizeExceedsFileSize { .. }
-                        | CorruptionType::MetadataSizeOverflow { .. },
-                    ..
-                })) => {
+                Err(
+                    e @ DbError::DataCorrupted(DataCorruptedErr {
+                        reason:
+                            CorruptionType::CrcMismatch {
+                                mismatch_type: CrcType::SparseIndex,
+                                ..
+                            }
+                            | CorruptionType::MetaDataSizeExceedsFileSize { .. }
+                            | CorruptionType::MetadataSizeOverflow { .. },
+                        ..
+                    }),
+                ) => {
                     // rebuild all the metadata(sparse, bloom, min max etc)
                     // what needs to be done here? we have a sstable with presumably some correct data in there but
                     // the metadata is corrupt, do I read the sstable front to back and create the metadata as we go?
@@ -1553,6 +1639,7 @@ impl KVEngine {
                     // and how long the data_block_length is, meaning if there is a corrupt sparse_index, I cannot rebuild it because
                     // I dont know where data_blocks start or end
                     // LEAVING THIS HERE BECAUSE I WILL IMPLEMENT THIS LATER
+                    return Err(e); // for now reject
                 }
                 Err(
                     DbError::InvalidSstableFileName(_p) | DbError::NonNumericFileIdOnSstable(_p),
@@ -1560,9 +1647,7 @@ impl KVEngine {
                     continue;
                 }
                 Err(dberr) => {
-                    continue;
-                    // we can reach here if read_exact fails for example or seeking fails
-                    // what to do? skip for now
+                    return Err(dberr); // reject here. 
                 }
             }
         }
@@ -1597,12 +1682,10 @@ impl KVEngine {
                     if ss.level < SST_LEVEL_COUNT as u8 {
                         sstables[ss.level as usize].push(ss);
                     } else {
-                        // probs corrupted
                         self_instance.corrupted_files.insert(ss.file_path);
-                        // put in a corrupted vec
                     }
                 }
-                Err(e) => continue,
+                Err(e) => return Err(e),
                 Ok(None) => continue,
             }
         }
@@ -1779,15 +1862,13 @@ impl KVEngine {
             Absent => {} // fall through
         }
 
-        if let Some(frozen_memtable_collection) = self.frozen_memtables.as_ref() {
-            for (id, mem_table_instance) in frozen_memtable_collection.iter().rev() {
-                // rev() because we search newer memtables first which have a higher id(hlc)
+        for (id, mem_table_instance) in self.frozen_memtables.iter().rev() {
+            // rev() because we search newer memtables first which have a higher id(hlc)
 
-                match mem_table_instance.memtable.get(key) {
-                    Found(bytes) => return Ok(Some(bytes.to_vec())),
-                    Deleted => return Ok(None),
-                    Absent => {}
-                }
+            match mem_table_instance.memtable.get(key) {
+                Found(bytes) => return Ok(Some(bytes.to_vec())),
+                Deleted => return Ok(None),
+                Absent => {}
             }
         }
 
@@ -1795,6 +1876,9 @@ impl KVEngine {
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        if self.wal_failed {
+            return Err(DbError::WalFailed);
+        }
         self.memtable
             .exceeds_max(key.len() as u64, value.len() as u64)?;
 
@@ -1803,10 +1887,22 @@ impl KVEngine {
         {
             self.rotate_memtable_and_wal()?;
         }
-        // let tstamp = new_timestamp();
+
         let hlc = self.hlc.tick();
-        self.wal
-            .record_to_wal(WalRecordType::Insertion(key, value), hlc)?;
+        match self
+            .wal
+            .record_to_wal(WalRecordType::Insertion(key, value), hlc)
+        {
+            Ok(()) => {}
+            Err(e) => {
+                // can fail because of hardware failure, disk full etc.
+                // in that case subsequent writes will also fail so we stop accepting writes
+                // how to handle? check what other dbs do but no need to go too far into it
+
+                self.wal_failed = true;
+                return Err(e);
+            }
+        }
 
         self.memtable.put(key, value, hlc);
 
@@ -1814,6 +1910,9 @@ impl KVEngine {
     }
 
     fn delete(&mut self, key: &[u8]) -> Result<()> {
+        if self.wal_failed {
+            return Err(DbError::WalFailed);
+        }
         let k_len = key.len() as u64;
         self.memtable.exceeds_max(k_len, 0)?;
         if (k_len + self.memtable.size_in_bytes) > self.memtable.threshold {
@@ -1821,7 +1920,13 @@ impl KVEngine {
         }
         // let tstamp = new_timestamp();
         let hlc = self.hlc.tick();
-        self.wal.record_to_wal(WalRecordType::Deletion(key), hlc)?;
+        match self.wal.record_to_wal(WalRecordType::Deletion(key), hlc) {
+            Ok(()) => {}
+            Err(e) => {
+                self.wal_failed = true;
+                return Err(e);
+            }
+        }
         self.memtable.delete(key, hlc);
 
         Ok(())
@@ -1869,16 +1974,15 @@ impl KVEngine {
         // if yes, we have to wait for all of those to finish to retire Node.600
         // on poll, run a while loop that gets the first element(dont pop yet), checks if its finished, if yes retire(first element means OLDEST by id) so its okay to retire
         // also make sure to mark the mem returned as finished before this
-        if let Some(frozen_mems) = self.frozen_memtables.as_mut() {
-            frozen_mems.insert(
-                tick,
-                FrozenMemtableInstance {
-                    finished: false,
-                    memtable: Arc::clone(&frozen),
-                    id: tick,
-                },
-            );
-        }
+        let frozen_mems = &mut self.frozen_memtables;
+        frozen_mems.insert(
+            tick,
+            FrozenMemtableInstance {
+                finished: false,
+                memtable: Arc::clone(&frozen),
+                id: tick,
+            },
+        );
 
         self.flushing_manager.background_flush_memtable(
             FrozenMemtableInstance {
@@ -1902,7 +2006,7 @@ impl KVEngine {
 
     fn get_min_max_key_range_of_entire_level(
         &self,
-        sstables: &Vec<SSTable>,
+        sstables: &[SSTable],
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         let mut curr_min_max: Option<(&[u8], &[u8])> = None;
 
@@ -1929,30 +2033,41 @@ impl KVEngine {
     fn select_files_for_l0_compaction(
         &self,
         levels: &RwLockReadGuard<'_, [Vec<SSTable>; 4]>,
-    ) -> Result<Option<Vec<PathBuf>>> {
-        let mut vec_of_overlapping_pathbufs: Vec<PathBuf> = Vec::new();
+    ) -> Result<Option<Vec<CompactionSstSlice>>> {
+        let mut vec_of_overlapping_pathbufs: Vec<&SSTable> = Vec::new();
         let ssts_in_level = &levels[0];
         if let Some((min_k, max_k)) = self.get_min_max_key_range_of_entire_level(ssts_in_level)? {
             let _ = &levels[0]
                 .iter()
-                .for_each(|ss| vec_of_overlapping_pathbufs.push(ss.file_path.clone()));
-            // what if L1 is empty?
+                .for_each(|ss| vec_of_overlapping_pathbufs.push(ss));
+
             if let Some(vector_of_sstables_one_level_up) = levels.get(1_usize) {
                 vector_of_sstables_one_level_up.iter().for_each(|sst| {
                     KVEngine::does_overlap(sst, min_k.as_slice(), max_k.as_slice()).then(|| {
-                        vec_of_overlapping_pathbufs.push(sst.file_path.clone());
+                        vec_of_overlapping_pathbufs.push(sst);
                     });
                 });
             }
         }
 
-        Ok(Some(vec_of_overlapping_pathbufs))
+        Ok(Some(
+            vec_of_overlapping_pathbufs
+                .iter()
+                .map(|x| {
+                    CompactionSstSlice::new(
+                        x.file_path.clone(),
+                        Arc::clone(&x.sparse_index),
+                        x.level,
+                    )
+                })
+                .collect::<Vec<CompactionSstSlice>>(),
+        ))
     }
 
     fn select_level_for_compaction(
         &self,
         levels: &RwLockReadGuard<'_, [Vec<SSTable>; 4]>,
-    ) -> Result<Option<(f64, u8)>> {
+    ) -> Option<(f64, u8)> {
         let mut best_ratio_candidate: Option<(f64, u8)> = None; // first number is ratio, second is what level
 
         let l0 = &levels[0];
@@ -1993,16 +2108,16 @@ impl KVEngine {
             }
         }
 
-        Ok(best_ratio_candidate)
+        best_ratio_candidate
     }
 
     fn select_files_for_compaction(
         &self,
         levels: &RwLockReadGuard<'_, [Vec<SSTable>; 4]>,
         level: u8,
-    ) -> Result<Option<Vec<PathBuf>>> {
+    ) -> Result<Option<Vec<CompactionSstSlice>>> {
         let mut best_candidate: Option<(u64, &SSTable)> = None; // will be made into a struct later
-        let mut files_to_compact: Option<Vec<PathBuf>> = None;
+        let mut files_to_compact: Option<Vec<&SSTable>> = None;
         // first  value is the size of the sum of bytes of all files(a level up) that overlap with SSTable
         // TODO: Remember to mark files picked for compaction
 
@@ -2019,14 +2134,15 @@ impl KVEngine {
         };
         for sstable in curr_level_sstables.iter() {
             let mut temp_curr_sum_of_file_sizes: u64 = 0;
-            let (min_k, max_k) = sstable.min_max_keys.as_ref().unwrap(); // will fix unwrap
+            let (min_k, max_k) = sstable.min_max_keys.as_ref().unwrap(); // it will always be here, we make sure in load()
+
             // keep curr sstable, and go up a level, find every single file that overlaps, do the math, if better than curr best_candidate, switch
 
-            let mut vec_of_overlapping_pathbufs: Vec<PathBuf> = Vec::new();
+            let mut vec_of_overlapping_pathbufs: Vec<&SSTable> = Vec::new();
             vector_of_sstables_one_level_up.iter().for_each(|sst| {
                 KVEngine::does_overlap(sst, min_k, max_k).then(|| {
                     // we should also push to the vector of Pathbufs here
-                    vec_of_overlapping_pathbufs.push(sst.file_path.clone());
+                    vec_of_overlapping_pathbufs.push(sst);
                     temp_curr_sum_of_file_sizes += sst.file_size;
                 });
             });
@@ -2037,35 +2153,47 @@ impl KVEngine {
                             > (temp_curr_sum_of_file_sizes as f64 / sstable.file_size as f64)
                     {
                         best_candidate = Some((temp_curr_sum_of_file_sizes, sstable));
-                        vec_of_overlapping_pathbufs.push(sstable.file_path.clone());
+                        vec_of_overlapping_pathbufs.push(sstable);
                         files_to_compact = Some(vec_of_overlapping_pathbufs)
                     }
                 }
                 None => {
                     best_candidate = Some((temp_curr_sum_of_file_sizes, sstable));
-                    vec_of_overlapping_pathbufs.push(sstable.file_path.clone());
+                    vec_of_overlapping_pathbufs.push(sstable);
                     files_to_compact = Some(vec_of_overlapping_pathbufs)
                 }
             }
         }
 
-        Ok(files_to_compact)
+        if let Some(files) = files_to_compact {
+            Ok(Some(
+                files
+                    .iter()
+                    .map(|x| {
+                        CompactionSstSlice::new(
+                            x.file_path.clone(),
+                            Arc::clone(&x.sparse_index),
+                            x.level,
+                        )
+                    })
+                    .collect::<Vec<CompactionSstSlice>>(),
+            ))
+        } else {
+            Ok(None)
+        }
     }
 
-    fn compact(&self) -> Result<Option<()>> {
-        // Todo tomorrow: The compaction manager needs CompactionSstSlices so maybe just build it here since we have ssts
-        // CompactionSstSlice::new(args)
-        // find a way to mark picked sstables atomically
-        // unfinished
+    fn compact(&mut self) -> Result<Option<bool>> {
+        if self.compaction_manager.is_busy() {
+            return Ok(None);
+        }
+
         if let Some(levels) = &self.sstables {
             let levels = levels.read().unwrap();
 
             let level = match self.select_level_for_compaction(&levels) {
-                Err(e) => {
-                    todo!()
-                }
-                Ok(Some((ratio, level))) => level,
-                Ok(None) => return Ok(None),
+                Some((_, level)) => level,
+                None => return Ok(None),
             };
 
             let files = match self.select_files_for_compaction(&levels, level) {
@@ -2073,16 +2201,25 @@ impl KVEngine {
                 Err(e) => return Err(e),
                 Ok(None) => return Ok(None),
             };
-        }
+            let compaction_job = CompactionJob::new(
+                files,
+                level + 1,
+                self.data_directory.clone(),
+                Arc::clone(&self.hlc),
+            );
 
-        Ok(Some(()))
+            self.compaction_manager.start(compaction_job)?; // if this throws an error, theres another compaction running so just throw away, compact will be called again
+        } // 
+
+        Ok(Some(true))
     }
 }
 
 /*Notes:
  // footer is : sparse_index | bloom_filter | min key | max key |  sparse_index_offset| sizeof(sparse_index) | sizeof(bloom_filter) | sizeof(minkey) | sizeof(maxkey) | LevelofSST(1 byte) | sparse_crc(4 bytes) | bloom_crc(4 bytes) | min_max_key_crc(4) | metadata_crc(4 bytes) |
 
-DataBlocks:  [ tstamp(8) | ksz(8) | value_sz(8) | key | value  tstamp(8) | ksz(8) | value_sz(8) | key | value ... crc(4)]
+DataBlocks:  [ tstamp(8) | ksz(8) | value_sz(8) | tombstone | key | value |  ] ... crc(4) (crc for the entire datablock);
+    pub size: usize,
 SSTable: Datablock1 | DataBlock2 ... Datablock N | Footer
 Bloom filter: k-hash bit array per SSTable to skip files on negative lookups. Use 10 bits per key. Built during flush of AVL.
 */
@@ -2118,6 +2255,8 @@ Atomics u64
 
 TODO: USE read_exact_at from FileExt trait in place of every read_exact call()
 // chekc static vs dynamic level sizing(rocksdb)
+// TODO: make sure to document the different parsers and how records are written in different formats in some places. One change somewhere can break things in other palces
+// use consts no magic ns
 
 // TODO: WRITE TESTS
  //
