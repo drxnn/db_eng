@@ -5,33 +5,36 @@ use crate::{
     },
     lsm::Hlc,
 };
-use crc::{CRC_32_ISO_HDLC, Crc};
+use crc::{CRC_32_ISO_HDLC, Crc, Digest};
 use xxhash_rust::xxh3::xxh3_128;
 pub const NUM_HASHES: usize = 7;
-pub fn compute_crc(
-    timestamp: &[u8; 8],
-    key_size: &[u8; 8],
-    value_size: &[u8; 8],
-    key: &[u8],
-    value: &[u8],
-) -> u32 {
-    // TODO: Do not call the new function below for every crc
-    let crc32 = Crc::<u32>::new(&CRC_32_ISO_HDLC);
-    let mut digest = crc32.digest();
-    digest.update(timestamp);
-    digest.update(key_size);
-    digest.update(value_size);
-    digest.update(key);
-    digest.update(value);
-    digest.finalize()
+
+pub struct Crc32 {
+    crc32: Crc<u32>,
 }
 
-pub fn compute_crc_data_block(data: &[u8]) -> u32 {
-    let crc32 = Crc::<u32>::new(&CRC_32_ISO_HDLC);
-    let mut digest = crc32.digest();
-    digest.update(data);
-    digest.finalize()
+impl Crc32 {
+    pub const fn new() -> Self {
+        Self {
+            crc32: Crc::<u32>::new(&CRC_32_ISO_HDLC),
+        }
+    }
+
+    pub fn compute_crc_data_block(&self, data: &[u8]) -> u32 {
+        self.crc32.checksum(data)
+    }
+    pub fn digest(&self) -> Digest<'_, u32> {
+        self.crc32.digest()
+    }
 }
+pub static CRC32: Crc32 = Crc32::new();
+
+// pub fn compute_crc_data_block(data: &[u8]) -> u32 {
+//     let crc32 = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+//     let mut digest = crc32.digest();
+//     digest.update(data);
+//     digest.finalize()
+// }
 
 #[cfg(target_os = "macos")]
 use std::io::Error;
@@ -135,18 +138,6 @@ pub fn check_crc(
     }
 }
 
-// pub fn check_length_does_not_exceed_max(
-//     length: u64,
-//     max_length: u64,
-//     offset: u64,
-//     file_path: &PathBuf,
-//     err_to_throw: DataCorruptedErr,
-// ) -> Result<()> {
-//     if length > max_length {
-//     } else {
-//         Ok(())
-//     }
-// }
 pub fn check_key_value_record_does_not_exceed_max(
     size: u64,
     max_size: u64,

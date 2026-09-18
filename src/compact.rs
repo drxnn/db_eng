@@ -22,8 +22,8 @@ use crate::errors::CompactionErr::{self};
 
 use crate::errors::CrcType;
 use crate::helpers::{
-    check_crc, check_key_value_record_does_not_exceed_max, compute_crc_data_block,
-    create_new_data_file, get_positions_from_hashed_key, hash_key, read_exact_or_corrupt,
+    CRC32, check_crc, check_key_value_record_does_not_exceed_max, create_new_data_file,
+    get_positions_from_hashed_key, hash_key, read_exact_or_corrupt,
 };
 use crate::lsm::{
     AVL, BloomFilter, DATA_BLOCK_MAX_BYTES_SIZE, Hlc, MAX_SST_SIZE, SparseIndex, SsTableDataBlock,
@@ -162,6 +162,7 @@ impl MergeItem {
 struct CompactionFileElement {
     sst_slice: CompactionSstSlice,
     reader: BufReader<File>,
+    reader_pos: u64,
     current_data_block: Option<SsTableDataBlock>,
     curr_offset_from_file: u64,
 }
@@ -182,6 +183,7 @@ impl CompactionFileElement {
             sst_slice,
             reader,
             current_data_block: None,
+            reader_pos: 0,
             curr_offset_from_file: 0,
         })
     }
@@ -263,7 +265,7 @@ impl CompactionFileElement {
                 }
             };
 
-            let mut key = vec![0u8; key_size as usize];
+            let mut key: Vec<u8> = vec![0u8; key_size as usize];
             read_exact_or_corrupt(
                 &mut curr_data_block.bytes,
                 &mut key,
@@ -272,7 +274,7 @@ impl CompactionFileElement {
             )?;
             self.curr_offset_from_file += key_size;
 
-            let mut val = vec![0u8; val_size as usize];
+            let mut val: Vec<u8> = vec![0u8; val_size as usize];
             read_exact_or_corrupt(
                 &mut curr_data_block.bytes,
                 &mut val,
@@ -281,11 +283,11 @@ impl CompactionFileElement {
             )?;
             self.curr_offset_from_file += val_size;
             Ok(Some(HeapEntry {
-                key: key.to_vec(),
+                key,
                 timestamp: u64::from_le_bytes(tstamp),
                 deleted,
                 vsz: val_size,
-                value: val.to_vec(),
+                value: val,
             }))
         } else {
             Ok(None)
@@ -316,7 +318,11 @@ impl CompactionFileElement {
         // This reassignment below accounts for the 4 bytes of the CRC that the data_block_len doesnt account for.
         // Instead of adding 4 to the curr_offset, we just reassign to the next datablock offset start
         self.curr_offset_from_file = offset;
-        reader.seek(SeekFrom::Start(offset))?;
+        if self.reader_pos != offset {
+            // if reader_pos has drifted somehow, only then we seek
+            reader.seek(SeekFrom::Start(offset))?;
+            self.reader_pos = offset;
+        }
 
         let mut bytes = vec![0u8; data_len as usize];
         let mut crc = [0u8; 4];
@@ -325,7 +331,7 @@ impl CompactionFileElement {
 
         read_exact_or_corrupt(reader, &mut crc[..], self.curr_offset_from_file, &file_path)?;
 
-        let crc_to_check = compute_crc_data_block(&bytes);
+        let crc_to_check = CRC32.compute_crc_data_block(&bytes);
         let crc_from_buff = u32::from_le_bytes(crc);
         // Todo: the crc check/throw error needs to be put in a function, gets reused a lot
         // have the caller account for this error
@@ -337,7 +343,7 @@ impl CompactionFileElement {
             &self.sst_slice.file_path,
             CrcType::DataBlock,
         )?;
-
+        self.reader_pos += data_len + 4;
         new_data_block.append_to_block(&bytes); // whole datablock
 
         self.current_data_block = Some(new_data_block);
@@ -353,7 +359,7 @@ impl CompactionFileElement {
 pub struct CompactionManager {
     // if theres a compaction currently running while we have another one just add to queue,
     // then remove from queue when compaction is done // pop
-    running_job: Option<JoinHandle<CompactionOutcome>>,
+    running_job: Option<JoinHandle<Result<CompactionOutcome>>>,
 }
 
 impl CompactionManager {
@@ -378,7 +384,7 @@ impl CompactionManager {
         self.running_job.is_some()
     }
 
-    pub fn poll(&mut self) -> Option<CompactionOutcome> {
+    pub fn poll(&mut self) -> Option<Result<CompactionOutcome>> {
         let handle = self.running_job.take()?;
         if !handle.is_finished() {
             self.running_job = Some(handle);
@@ -401,14 +407,8 @@ pub struct CompactionJob {
 #[derive(Default)]
 pub struct CompactionOutcome {
     pub final_sst_files: Vec<(PathBuf, PathBuf)>, // (tmp_file, final_file). Tmp holds the data, atomically rename to final, tmp is necessary in case of an error during cmpt
-
-    pub consumed_sst_files: Vec<PathBuf>, // files that were completely merged
-    // TODO: should I accept partially merged files? there would be data loss and if its l0, we can serve bad data
-    // reject entire job if this happens?
-    pub partially_consumed_sst_files: Vec<(PathBuf, DbError)>, // files that were partially merged but then stumbled upon corrupted data
-    pub skipped_sst_files: Vec<(PathBuf, DbError)>,
+    pub consumed_sst_files: Vec<PathBuf>,         // files that were completely merged
     level_for_output_sst: u8, // files were skipped because they threw an error during new(), data is most likely corrupted, main can decide what to do with these depending on the error, maybe the File::open() failed for some reason which doesnt mean data is corrupted
-    pub compaction_err: Option<DbError>,
 }
 
 impl CompactionOutcome {
@@ -416,10 +416,7 @@ impl CompactionOutcome {
         Self {
             final_sst_files: Vec::new(),
             consumed_sst_files: Vec::new(),
-            partially_consumed_sst_files: Vec::new(),
-            skipped_sst_files: Vec::new(),
             level_for_output_sst,
-            compaction_err: None,
         }
     }
 }
@@ -439,7 +436,7 @@ impl CompactionJob {
         }
     }
 
-    fn run(self) -> CompactionOutcome {
+    fn run(self) -> Result<CompactionOutcome> {
         let CompactionJob {
             files,
             data_dir,
@@ -449,45 +446,39 @@ impl CompactionJob {
         let mut cmpt_outcome = CompactionOutcome::new(level_for_output_sst);
         let mut cfe_vec: Vec<CompactionFileElement> = Vec::with_capacity(files.len());
 
-        let mut heap: BinaryHeap<Reverse<MergeItem>> = BinaryHeap::with_capacity(files.len());
+        let result = (|| -> Result<()> {
+            let mut heap: BinaryHeap<Reverse<MergeItem>> = BinaryHeap::with_capacity(files.len());
+            for x in files.into_iter() {
+                let mut cfe = CompactionFileElement::new(x)?;
 
-        for x in files.into_iter() {
-            let x_path = x.file_path.clone();
-            let mut cfe = match CompactionFileElement::new(x) {
-                Ok(compact_el) => compact_el,
-                Err(e) => {
-                    cmpt_outcome.skipped_sst_files.push((x_path, e)); // have main check what error is, could be DbError:TooManyFilesOpenInProcess so main can decide what to do
-                    continue;
-                }
-            };
-
-            let idx = cfe_vec.len(); // THe index that the cfe is about to take
-            match MergeItem::new(&mut cfe, idx) {
-                Ok(m_item) => {
-                    if let Some(m) = m_item {
-                        heap.push(Reverse(m));
-                    } else {
-                        cmpt_outcome
-                            .consumed_sst_files
-                            .push(cfe.sst_slice.file_path.clone());
+                let idx = cfe_vec.len(); // THe index that the cfe is about to take
+                match MergeItem::new(&mut cfe, idx) {
+                    Ok(m_item) => {
+                        if let Some(m) = m_item {
+                            heap.push(Reverse(m));
+                        } else {
+                            cmpt_outcome
+                                .consumed_sst_files
+                                .push(cfe.sst_slice.file_path.clone());
+                        }
                     }
-                }
-                Err(e) => {
-                    cmpt_outcome.skipped_sst_files.push((x_path, e)); // main can handle
-                    // we continue meaning cfe doesnt get pushed to vec
-                    continue;
-                } // read above
-            };
+                    Err(e) => return Err(e), // read above
+                };
 
-            cfe_vec.push(cfe);
-        }
+                cfe_vec.push(cfe);
+            }
+            CompactionJob::merge_to_final(&mut cmpt_outcome, heap, &mut cfe_vec, data_dir, hlc)
+        })();
+
         // same as above, should not happen
 
-        match CompactionJob::merge_to_final(&mut cmpt_outcome, heap, &mut cfe_vec, data_dir, hlc) {
-            Ok(()) => cmpt_outcome,
+        match result {
+            Ok(()) => Ok(cmpt_outcome),
             Err(e) => {
-                cmpt_outcome.compaction_err = Some(e);
-                cmpt_outcome
+                for (tmp, _) in &cmpt_outcome.final_sst_files {
+                    let _ = fs::remove_file(tmp);
+                }
+                Err(e)
             }
         }
     }
@@ -524,16 +515,15 @@ impl CompactionJob {
             sst_finalizer.level,
         );
         // Repeating myself below with the boundary checks, put in a function
-        let footer_crc = compute_crc_data_block(&footer[footer.len() - 41..]);
-        let min_max_crc = compute_crc_data_block(&footer[..footer.len() - 41]);
-        let sparse_crc = compute_crc_data_block(&sst_finalizer.sparse_index.index_entries);
+        let footer_crc = CRC32.compute_crc_data_block(&footer[footer.len() - 41..]);
+        let min_max_crc = CRC32.compute_crc_data_block(&footer[..footer.len() - 41]);
+        let sparse_crc = CRC32.compute_crc_data_block(&sst_finalizer.sparse_index.index_entries);
 
         sst_finalizer
             .writer
             .write_all(&sst_finalizer.sparse_index.index_entries)?;
 
-        let crc32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
-        let mut bloom_digest = crc32.digest();
+        let mut bloom_digest = CRC32.digest();
         for word in &bloom_filter.bits {
             bloom_digest.update(&word.to_le_bytes());
             sst_finalizer.writer.write_all(&word.to_le_bytes())?;
@@ -632,23 +622,17 @@ impl CompactionJob {
                 "source index is always valid: cfe_vec is append-only and idx is assigned pre push",
             ); // TODO: dont expect anyways, just throw err
             // if item is the same as last one, we are skipping it because the newer key has already been written to final file
-            let _ = MergeItem::new(cfe, curr_merge_item.0.source)
-                .map(|x| {
-                    match x {
-                        Some(m) => heap.push(Reverse(m)),
-                        None => {
-                            compaction_outcome
-                                .consumed_sst_files
-                                .push(cfe.sst_slice.file_path.clone());
-                            // DATA BLOCK EXHAUSTED -> fully_consumed vec
-                        } // if this returns none, file has been fully read and we push it to the fully_consumed_file vector
-                    }
-                })
-                .map_err(|e| {
-                    compaction_outcome
-                        .partially_consumed_sst_files
-                        .push((cfe.sst_slice.file_path.clone(), e))
-                });
+            MergeItem::new(cfe, curr_merge_item.0.source).map(|x| {
+                match x {
+                    Some(m) => heap.push(Reverse(m)),
+                    None => {
+                        compaction_outcome
+                            .consumed_sst_files
+                            .push(cfe.sst_slice.file_path.clone());
+                        // DATA BLOCK EXHAUSTED -> fully_consumed vec
+                    } // if this returns none, file has been fully read and we push it to the fully_consumed_file vector
+                }
+            })?; // err
         }
 
         Self::finalize_output_merged_file(sst_finalizer)?;

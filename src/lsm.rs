@@ -17,15 +17,15 @@ use std::sync::{Weak, mpsc};
 use std::thread::spawn;
 use std::{todo, unimplemented, unreachable};
 
-use crate::compact::{CompactionJob, CompactionManager, CompactionOutcome, CompactionSstSlice};
-use crate::errors::CorruptionType::Other;
+use crate::compact::{CompactionJob, CompactionManager, CompactionSstSlice};
+use crate::errors::CorruptionType::{Other, SstLevelMalformed};
 use crate::errors::{
     CorruptionType, CrcType, DataCorruptedErr, DbError, InvalidMemtableInput, Result,
 };
+use crate::helpers::CRC32;
 use crate::helpers::{
-    NUM_HASHES, check_crc, compute_crc_data_block, create_new_data_file,
-    find_max_hlc_between_files, get_hashed_key_positions, new_timestamp, read_exact_or_corrupt,
-    read_range,
+    NUM_HASHES, check_crc, create_new_data_file, find_max_hlc_between_files,
+    get_hashed_key_positions, new_timestamp, read_exact_or_corrupt, read_range,
 };
 use crate::lsm::Lookup::{Absent, Deleted, Found};
 
@@ -244,7 +244,7 @@ impl WAL {
             }
         }
 
-        let crc = compute_crc_data_block(record_buffer);
+        let crc = CRC32.compute_crc_data_block(record_buffer);
         record_buffer.extend_from_slice(&crc.to_le_bytes());
 
         match self.wal_writer.as_mut() {
@@ -286,7 +286,7 @@ impl SsTableDataBlock {
     }
 
     pub fn full_data_block(mut self) -> Self {
-        let crc = compute_crc_data_block(self.bytes.get_ref());
+        let crc = CRC32.compute_crc_data_block(self.bytes.get_ref());
         self.bytes.get_mut().extend_from_slice(&crc.to_le_bytes());
         self
     }
@@ -366,6 +366,11 @@ pub struct SSTable {
 impl SSTable {
     pub fn load(path: &Path) -> Result<Self> {
         let mut f = File::open(path)?;
+        let file_metadata = f.metadata()?;
+
+        if file_metadata.len() <= 57 {
+            // file too small
+        }
         let stem = path
             .file_stem()
             .and_then(|x| x.to_str())
@@ -394,7 +399,7 @@ impl SSTable {
         let sparse_index_crc_in_file = u32::from_le_bytes(sparse_index_crc);
         let bloom_filter_crc_in_file = u32::from_le_bytes(bloom_filter_crc);
 
-        let footer_metadata_crc_check = compute_crc_data_block(&footer);
+        let footer_metadata_crc_check = CRC32.compute_crc_data_block(&footer);
 
         check_crc(
             footer_metadata_crc_check,
@@ -405,6 +410,14 @@ impl SSTable {
         )?;
 
         let level = u8::from_le_bytes(read_range(&footer, 40, 41)?.try_into().unwrap());
+
+        if level as usize >= SST_LEVEL_COUNT {
+            return Err(DbError::DataCorrupted(DataCorruptedErr {
+                offset: file_metadata.len() - 17,
+                file_path: path.to_path_buf(),
+                reason: SstLevelMalformed(level as usize),
+            }));
+        }
         let file_length = f.metadata()?.len();
 
         let sparse_index_offset =
@@ -461,7 +474,7 @@ impl SSTable {
 
         // let sparse_index: &[u8] = &full_sst_data[0..(size_of_sparse_index as usize)];
         let sparse_index: &[u8] = read_range(&full_sst_data, 0, size_of_sparse_index as usize)?;
-        let sparse_index_crc_check = compute_crc_data_block(sparse_index);
+        let sparse_index_crc_check = CRC32.compute_crc_data_block(sparse_index);
 
         check_crc(
             sparse_index_crc_check,
@@ -477,7 +490,7 @@ impl SSTable {
             bloom_filter_end as usize as usize,
         )?;
 
-        let bloom_filter_crc_check = compute_crc_data_block(bloom_filter);
+        let bloom_filter_crc_check = CRC32.compute_crc_data_block(bloom_filter);
 
         // &full_sst_data[(bloom_filter_start as usize)..(bloom_filter_end as usize)];
         let min_key = read_range(
@@ -489,7 +502,7 @@ impl SSTable {
         // let max_k = &full_sst_data[(max_k_start as usize)..(max_k_end as usize)];
         let max_k = read_range(&full_sst_data, max_k_start as usize, max_k_end as usize)?;
 
-        let min_max_key_crc_to_check = compute_crc_data_block(read_range(
+        let min_max_key_crc_to_check = CRC32.compute_crc_data_block(read_range(
             &full_sst_data,
             min_k_start as usize,
             max_k_end as usize,
@@ -597,7 +610,7 @@ impl SSTable {
         let crc = &data_block_buffer_and_crc[(*last_data_block_length as usize)..];
 
         check_crc(
-            compute_crc_data_block(data_block_buffer),
+            CRC32.compute_crc_data_block(data_block_buffer),
             u32::from_le_bytes(crc.try_into().unwrap()),
             *last_sparse_offset,
             &self.file_path,
@@ -1053,14 +1066,13 @@ impl AVL {
 
             let footer_len = footer.len();
 
-            let footer_crc = compute_crc_data_block(&footer[footer_len - 41..footer_len]);
-            let min_max_crc = compute_crc_data_block(&footer[..footer_len - 41]);
-            let sparse_crc = compute_crc_data_block(&sparse_index.index_entries);
+            let footer_crc = CRC32.compute_crc_data_block(&footer[footer_len - 41..footer_len]);
+            let min_max_crc = CRC32.compute_crc_data_block(&footer[..footer_len - 41]);
+            let sparse_crc = CRC32.compute_crc_data_block(&sparse_index.index_entries);
 
             writer.write_all(&sparse_index.index_entries)?;
 
-            let crc32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
-            let mut bloom_digest = crc32.digest();
+            let mut bloom_digest = CRC32.digest();
 
             for word in &bloom_filter.bits {
                 bloom_digest.update(&word.to_le_bytes());
@@ -1087,7 +1099,10 @@ impl AVL {
 
             Ok(Some((f, ss_path_tmp, ss_path_final)))
         })()
-        .map_err(|err| DbError::SyncFail(Box::new(err), tmp_path_for_err_case))
+        .map_err(|err| {
+            let _ = fs::remove_file(&tmp_path_for_err_case);
+            DbError::SyncFail(Box::new(err), tmp_path_for_err_case)
+        })
     }
 }
 
@@ -1103,7 +1118,7 @@ struct FlushingManager {
 
 pub enum WalReplayState {
     Clean,                   // replayed everything to mem
-    PartialTruncated,        // field is offset where we stopped // JUST DELETE FILE HERE
+    PartialTruncated,        // JUST DELETE FILE HERE
     PartialCorrupt(DbError), // offset, err // HERE YOU TELL THE CALLER THAT FILE IS CORRUPT
 }
 pub struct WalToMemtableReplay {
@@ -1128,82 +1143,24 @@ impl FlushingManager {
         hlc: u64,
     ) -> Result<()> {
         let tx: Sender<FlushingThreadResponse> = self.tx.clone();
-
+        let id = frozen_instance.id;
         spawn(move || -> Result<()> {
-            let (f, ss_path_final) = match frozen_instance
-                .memtable
-                .sync_avl(&dir, frozen_instance.id)
-            {
-                Ok(Some((f, _, ss_path_final))) => {
-                    if let Some(dir) = ss_path_final.parent() {
-                        // always should have parent
-                        File::open(dir)?.sync_all()?;
-                    }
+            let result = (|| -> Result<SSTable> {
+                let (_, f, ss_path_final) = frozen_instance
+                    .memtable
+                    .sync_avl(&dir, frozen_instance.id)?
+                    .ok_or_else(|| {
+                        DbError::MemTableSyncError("The memtable returned None".to_string())
+                    })?;
+                File::open(dir)?.sync_all()?;
+                SSTable::load(&ss_path_final)
+            })();
 
-                    (f, ss_path_final)
-                }
-                Err(DbError::SyncFail(err, path)) => {
-                    // delete the path since sync failed
-                    let _ = fs::remove_file(&path);
-                    let _ = tx.send(FlushingThreadResponse::Error {
-                        id: frozen_instance.id,
-                        error: DbError::SyncFail(Box::new(*err), path.to_path_buf()),
-                    });
-                    return Err(DbError::ReportedViaChannel);
-                }
-                Err(e) => {
-                    let _ = tx.send(FlushingThreadResponse::Error {
-                        id: frozen_instance.id,
-                        error: e,
-                    });
-                    return Err(DbError::ReportedViaChannel);
-                }
-                Ok(None) => {
-                    // channel should know
-                    let _ = tx.send(FlushingThreadResponse::Error {
-                        id: frozen_instance.id,
-                        error: DbError::MemTableSyncError("The memtable returned None".to_string()),
-                    });
-                    return Err(DbError::ReportedViaChannel); // empty AVL, do nothing
-                }
+            let msg = match result {
+                Ok(sstable) => FlushingThreadResponse::Success { id, sstable },
+                Err(error) => FlushingThreadResponse::Error { id, error },
             };
-
-            let sstable = SSTable::load(&ss_path_final);
-            // TODO HERE: now that I am returning an error on the crc check fail, we need to rebuild the SStable in the case of
-            // the spars index being corrupted, use crcmismatch type
-            // if other err like: NonNumericFileIdOnSstable just send the error to main
-            match sstable {
-                Ok(sst) => {
-                    // PROBLEM: WE INITIATE THE SEND TO MAIN HERE, HOWEVER FROZEN GETS DROPPED AT THE END OF THIS FUNCTION WHICH IN TURN
-                    // MEANS THAT THE WEAK MIGHT ALSO DROP THE MEMTABLE, SO WE CAN HAVE LOSS OF DATA IN THE SPAN OF THIS SEND
-                    // TO ITS RECEIVAL, SO JUST USE AN ARC FOR FLUSHING MEMTABLE AS WELL AND JUST DORP IT EXPLICITLY
-                    // DONE: JUST REMEMBER TO DROP THE ARC WHEN MAIN RECEIVES THIS
-                    let _ = tx.send(FlushingThreadResponse::Success {
-                        id: frozen_instance.id,
-                        sstable: sst,
-                    });
-                }
-                Err(DbError::DataCorrupted(DataCorruptedErr {
-                    reason:
-                        CorruptionType::CrcMismatch {
-                            mismatch_type: CrcType::SparseIndex,
-                            ..
-                        }
-                        | CorruptionType::MetaDataSizeExceedsFileSize { .. }
-                        | CorruptionType::MetadataSizeOverflow { .. },
-                    ..
-                })) => {
-                    //TODO READ COMMENT(WHERE WE CALL SSTable::load on KVE::open())
-                }
-                // SHOULD NOT GET ANY OF THE CRCMISMATCH ERRORS OR FAILURES HERE SINCE WE JUST SYNCED THIS TO FILE CORRECTLY
-                Err(dberr) => {
-                    let _ = tx.send(FlushingThreadResponse::Error {
-                        id: frozen_instance.id,
-                        error: dberr,
-                    });
-                    return Err(DbError::ReportedViaChannel);
-                }
-            }
+            let _ = tx.send(msg);
 
             Ok(())
         });
@@ -1263,7 +1220,7 @@ impl FlushingManager {
 
                         let crc_data_block =
                             [type_of_record.as_slice(), &tstamp, &ksz, &key_buffer].concat();
-                        let crc_to_check = compute_crc_data_block(&crc_data_block);
+                        let crc_to_check = CRC32.compute_crc_data_block(&crc_data_block);
 
                         read_exact_or_corrupt(&mut reader, &mut crc, curr_offset, path)?;
                         curr_offset += 4;
@@ -1317,7 +1274,7 @@ impl FlushingManager {
                             &val_buffer,
                         ]
                         .concat();
-                        let crc_to_check = compute_crc_data_block(&crc_data_block);
+                        let crc_to_check = CRC32.compute_crc_data_block(&crc_data_block);
 
                         read_exact_or_corrupt(&mut reader, &mut crc, curr_offset, path)?;
                         curr_offset += 4;
@@ -1391,47 +1348,35 @@ impl FlushingManager {
         dir: &PathBuf,
         hlc: &Hlc,
     ) -> Result<Option<SSTable>> {
-        let memtable = match self.build_avl_from_wal(path) {
-            Ok(replay) => {
-                // WE ENSURE OUR CURR HLC IS MORE RECENT THAN THE HIGHEST HLC IN THE WAL
-                if let Some(most_rec_hlc) = replay.most_recent_hlc {
-                    hlc.recover_to(most_rec_hlc);
-                    // if hlc is way ahead of most_rec_hlc, it doesnt recover to it, but this could be an issue because
-                    // then we are assigning the sst below a clock that is way ahead of its most recent record
-                    // which could be an issue if we have multiple WALs with different records, then we lose the correct order because they all get
-                    // a ordering of greater than the current clock, regardless of the records within them
-                    // so it would be better if the wal->sst files get a hlc directly from its most recent record
-                }
+        let replay = self.build_avl_from_wal(path)?;
+        if let WalReplayState::PartialCorrupt(e) = replay.replay_state {
+            return Err(e);
+        }
 
-                match replay.replay_state {
-                    WalReplayState::Clean | WalReplayState::PartialTruncated => replay.memtable,
-                    WalReplayState::PartialCorrupt(_) => {
-                        // TODO: caller might want to know that we worked on a corrupt file in the future
-                        // FOR LOGGING PURPOSES ^^
-                        replay.memtable
-                    }
-                }
-            }
-
-            Err(e) => {
-                // Didnt retrieve anything
-                return Err(e);
-            }
+        let Some(max_hlc) = replay.most_recent_hlc else {
+            let _ = fs::remove_file(path); // no hlc no records
+            return Ok(None);
         };
+        hlc.recover_to(max_hlc);
 
-        let (f, _, ss_final_path) = match memtable.sync_avl(dir, hlc.tick()) {
+        if dir.join(format!("{max_hlc}.sst")).exists() {
+            // in case the wal was already retrived but engine crashed before removing the file
+            let _ = fs::remove_file(path);
+            return Ok(None);
+        }
+        let (f, _, ss_final_path) = match replay.memtable.sync_avl(dir, max_hlc) {
             Ok(Some((f, tmp_file, ss_final_path))) => {
                 if let Some(dir) = ss_final_path.parent() {
                     // always should have parent
                     File::open(dir)?.sync_all()?;
                 }
-                let _ = fs::remove_file(path); // wal data has been put into sst, remove wal
+
                 (f, tmp_file, ss_final_path)
             }
             Err(DbError::SyncFail(err, path)) => {
                 let _ = fs::remove_file(&path);
 
-                return Err(DbError::SyncFail(Box::new(*err), path.to_path_buf()));
+                return Err(DbError::SyncFail(err, path.to_path_buf()));
             }
 
             Err(err) => {
@@ -1444,7 +1389,9 @@ impl FlushingManager {
                 };
             }
         };
+
         let sstable = SSTable::load(&ss_final_path)?;
+        let _ = fs::remove_file(path);
 
         Ok(Some(sstable))
     }
@@ -1454,6 +1401,7 @@ struct FrozenMemtableInstance {
     memtable: Arc<AVL>,
     finished: bool,
     id: u64, // hlc
+    wal_path: PathBuf,
 }
 // TODO:
 struct KVEngine {
@@ -1462,7 +1410,6 @@ struct KVEngine {
     sstables: Option<Arc<RwLock<[Vec<SSTable>; SST_LEVEL_COUNT]>>>, // [vec0(l0), vec1(l1)] .. etc/
     sync_config: SyncConfig,
     wal: WAL,
-    frozen_wal: Option<WAL>, // TODO: eventually there can be multiple of these
     memtable: AVL,
     frozen_memtables: BTreeMap<u64, FrozenMemtableInstance>, // ordered. id(hlc) -> mem
     // frozen_memtable: Option<Arc<AVL>>,                               // and here
@@ -1594,7 +1541,6 @@ impl KVEngine {
             sstables: None,
             wal,
             frozen_memtables: BTreeMap::new(),
-            frozen_wal: None,
             flushing_manager: FlushingManager::new(),
             corrupted_files: HashSet::new(),
             hlc: Arc::new(hlc),
@@ -1605,13 +1551,7 @@ impl KVEngine {
         for path in sst_vec {
             match SSTable::load(&path) {
                 Ok(sst) => {
-                    if sst.level < SST_LEVEL_COUNT as u8 {
-                        sstables[sst.level as usize].push(sst);
-                    } else {
-                        // probs corrupted
-                        self_instance.corrupted_files.insert(sst.file_path); // Should I store just the path or the entire SST? 
-                        // put in a corrupted vec
-                    }
+                    sstables[sst.level as usize].push(sst);
                 }
                 Err(
                     e @ DbError::DataCorrupted(DataCorruptedErr {
@@ -1745,7 +1685,7 @@ impl KVEngine {
         reader.read_exact(&mut crc)?;
         let crc_from_buff = u32::from_le_bytes(crc);
 
-        let fresh_crc = compute_crc_data_block(&data_buffer);
+        let fresh_crc = CRC32.compute_crc_data_block(&data_buffer);
 
         check_crc(
             fresh_crc,
@@ -1942,18 +1882,15 @@ impl KVEngine {
                 self.hlc.tick(),
             )?,
         );
+        let wal_path = old_wal.path.clone();
+        drop(old_wal);
+
         // WHEN MAIN(whoever polls it) RECEIVES A SUCCESSFUL FLUSH, REMOVE THE OLD WAL ASSOCIATED WITH THAT FLUSH
         let frozen = Arc::new(std::mem::replace(
             &mut self.memtable,
             AVL::new(MEMTABLE_THRESHOLD),
         ));
 
-        // PROBLEM: rotation1 starts, we create run this code here, we have flushing_mem and frozen_wal saved
-        // but before rotation1 sync finishes another one starts, replacing our flushing_mem and frozen_wal with the curr ones
-        // meaning we lose the rotation1 flushing mem data for lookup until rotation1 syncing is done.
-        // so use a structure that can hold multiple ordered ones
-
-        self.frozen_wal = Some(old_wal);
         let tick = self.hlc.tick();
 
         // WHEN MAIN RECEIVES MESSAGE ABOUT A SUCCESSFUL SST SYNCED, USE SST ID TO REMOVE IT FROM FROZEN COLLECTION
@@ -1978,6 +1915,7 @@ impl KVEngine {
         frozen_mems.insert(
             tick,
             FrozenMemtableInstance {
+                wal_path: wal_path.clone(), // remove after its done
                 finished: false,
                 memtable: Arc::clone(&frozen),
                 id: tick,
@@ -1987,6 +1925,7 @@ impl KVEngine {
         self.flushing_manager.background_flush_memtable(
             FrozenMemtableInstance {
                 finished: false,
+                wal_path,
                 memtable: Arc::clone(&frozen),
                 id: tick,
             },
@@ -2257,7 +2196,6 @@ TODO: USE read_exact_at from FileExt trait in place of every read_exact call()
 // chekc static vs dynamic level sizing(rocksdb)
 // TODO: make sure to document the different parsers and how records are written in different formats in some places. One change somewhere can break things in other palces
 // use consts no magic ns
-
 // TODO: WRITE TESTS
  //
 

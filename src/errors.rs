@@ -61,6 +61,7 @@ pub enum CorruptionType {
         found: u8,
     }, // add value that was expected too, either 0xFF or 0x00
     TruncatedRecord, // TODO: Not a corruption necessarily
+    SstLevelMalformed(usize),
 }
 
 #[derive(Debug)]
@@ -183,6 +184,13 @@ impl fmt::Display for CorruptionType {
             }
             Self::RecordTypeCorrupted { found } => {
                 write!(f, "Corrupted RecordType byte. Instead found: {}", found)
+            }
+            Self::SstLevelMalformed(lvl) => {
+                write!(
+                    f,
+                    "SST level does not fall within accepted level bounds. Level is {}",
+                    lvl
+                )
             }
         }
     }
