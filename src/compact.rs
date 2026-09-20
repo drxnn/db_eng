@@ -408,7 +408,7 @@ pub struct CompactionJob {
 pub struct CompactionOutcome {
     pub final_sst_files: Vec<(PathBuf, PathBuf)>, // (tmp_file, final_file). Tmp holds the data, atomically rename to final, tmp is necessary in case of an error during cmpt
     pub consumed_sst_files: Vec<PathBuf>,         // files that were completely merged
-    level_for_output_sst: u8, // files were skipped because they threw an error during new(), data is most likely corrupted, main can decide what to do with these depending on the error, maybe the File::open() failed for some reason which doesnt mean data is corrupted
+    pub level_for_output_sst: u8, // files were skipped because they threw an error during new(), data is most likely corrupted, main can decide what to do with these depending on the error, maybe the File::open() failed for some reason which doesnt mean data is corrupted
 }
 
 impl CompactionOutcome {
@@ -451,7 +451,7 @@ impl CompactionJob {
             for x in files.into_iter() {
                 let mut cfe = CompactionFileElement::new(x)?;
 
-                let idx = cfe_vec.len(); // THe index that the cfe is about to take
+                let idx = cfe_vec.len();
                 match MergeItem::new(&mut cfe, idx) {
                     Ok(m_item) => {
                         if let Some(m) = m_item {
@@ -462,15 +462,13 @@ impl CompactionJob {
                                 .push(cfe.sst_slice.file_path.clone());
                         }
                     }
-                    Err(e) => return Err(e), // read above
+                    Err(e) => return Err(e),
                 };
 
                 cfe_vec.push(cfe);
             }
             CompactionJob::merge_to_final(&mut cmpt_outcome, heap, &mut cfe_vec, data_dir, hlc)
         })();
-
-        // same as above, should not happen
 
         match result {
             Ok(()) => Ok(cmpt_outcome),
@@ -581,7 +579,6 @@ impl CompactionJob {
                     compaction_outcome
                         .final_sst_files
                         .push(sst_finalizer.sst_paths.clone());
-                    // TODO: if this ? throws, we have to take care of the finished_ssts in the Error case on the caller
                 }
 
                 sst_finalizer

@@ -89,8 +89,10 @@ pub enum DbError {
     InvalidSstableFileName(PathBuf),
     InvalidMemtableInput(InvalidMemtableInput),
     OutOfBoundsRead { start: u64, end: u64, len: u64 }, // TODO: extend this to be more elaborate
+    ManifestError(String), // TODO: make more elaborate = different kinds of ManifestErrs
 }
 #[derive(Debug)]
+
 pub enum InvalidMemtableInput {
     KeySizeTooLarge { max: u64, found: u64 },
     ValueSizeTooLarge { max: u64, found: u64 },
@@ -309,6 +311,9 @@ impl fmt::Display for DbError {
             }
             Self::WalFailed => {
                 write!(f, "Wal Failure.")
+            }
+            Self::ManifestError(s) => {
+                write!(f, "Manifest Err. Msg: {}", s)
             }
         }
     }

@@ -1,21 +1,18 @@
-use crc::{CRC_32_ISO_HDLC, Crc};
-use std::ops::Deref;
 use std::os::unix::fs::FileExt;
 
-use core::num;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions, remove_file};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 
 use std::path::{Path, PathBuf};
-use std::ptr::null;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
-use std::sync::{Weak, mpsc};
 use std::thread::spawn;
-use std::{todo, unimplemented, unreachable};
+use std::time::{Duration, Instant};
+use std::unreachable;
 
 use crate::compact::{CompactionJob, CompactionManager, CompactionSstSlice};
 use crate::errors::CorruptionType::{Other, SstLevelMalformed};
@@ -28,6 +25,7 @@ use crate::helpers::{
     get_hashed_key_positions, new_timestamp, read_exact_or_corrupt, read_range,
 };
 use crate::lsm::Lookup::{Absent, Deleted, Found};
+use crate::lsm::SyncConfig::{Always, Every};
 
 use std::cmp::{Ordering as CmpOrdering, Reverse, max};
 
@@ -52,6 +50,7 @@ pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L1_COMPACTION: u64 = MAX_SST_SIZE * 10;
 pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L2_COMPACTION: u64 = MAX_SST_SIZE * 100;
 pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L3_COMPACTION: u64 = MAX_SST_SIZE * 1000;
 pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L4_COMPACTION: u64 = MAX_SST_SIZE * 10000;
+pub const DEFAULT_DATA_DIR: &str = "data";
 
 // WAL config for flush
 
@@ -81,6 +80,25 @@ enum WalRecordType<'a> {
 pub struct SparseIndex {
     pub index_entries: Vec<u8>,
     pub size: u64,
+}
+
+// SOURCE OF TRUTH FOR STATE CHANGES IN THE DB
+// Manifest should accept different types of records
+// RECORD TYPE | RECORD | CRC
+
+// what different record types can we have ?
+// ADD_FILE_RECORD -> when a new sst is added either from flush or compaction
+// DELETE_FILE_RECORD -> file deletion, e.g after a successful compaction, we remove the input files or after we are done with a wal
+// DELETE_WAL RECORD -> after a successful flush
+// LATEST_WAL_RECORD -> name_of_wal | crc
+/*
+so it can look like:
+RECORD_LEN | (RECORD_TYPE | RECORD)* | CRC
+ |
+*/
+pub struct Manifest {
+    path: PathBuf,
+    writer: BufWriter<File>,
 }
 
 impl SparseIndex {
@@ -192,6 +210,7 @@ struct WAL {
     record_buffer: Vec<u8>,
     threshold: u64,
     path: PathBuf,
+    last_sync: Instant,
 }
 
 impl WAL {
@@ -214,6 +233,7 @@ impl WAL {
             record_buffer: Vec::new(),
             sync_c,
             path: wal_path,
+            last_sync: Instant::now(),
         })
     }
     fn destruct(mut self) -> Result<()> {
@@ -222,7 +242,6 @@ impl WAL {
         Ok(())
     }
 
-    // PROBLEM: Right now we sync_all for every single record, make sure you use SyncConfig later on for deciding
     fn record_to_wal<'a>(&mut self, record: WalRecordType<'a>, timestamp: u64) -> Result<()> {
         let record_buffer = &mut self.record_buffer;
         record_buffer.clear();
@@ -251,7 +270,21 @@ impl WAL {
             Some(writer) => {
                 writer.write_all(record_buffer)?;
                 writer.flush()?;
-                writer.get_ref().sync_all()?;
+                match self.sync_c {
+                    Always => {
+                        writer.get_ref().sync_all()?;
+                    }
+                    Every(ms) => {
+                        if self.last_sync.elapsed() >= Duration::from_millis(ms) {
+                            writer.get_ref().sync_all()?;
+                            self.last_sync = Instant::now()
+                        }
+                    }
+                    SyncConfig::None => {
+                        // yuhu
+                    }
+                }
+
                 Ok(())
             }
             None => Err(DbError::WalNotFound),
@@ -1399,8 +1432,8 @@ impl FlushingManager {
 
 struct FrozenMemtableInstance {
     memtable: Arc<AVL>,
-    finished: bool,
-    id: u64, // hlc
+    sstable: Option<SSTable>, // it should hold sstables until it is safe for it to be retired(when after every older memtable is gone from the BtreeMap)
+    id: u64,                  // hlc
     wal_path: PathBuf,
 }
 // TODO:
@@ -1916,7 +1949,7 @@ impl KVEngine {
             tick,
             FrozenMemtableInstance {
                 wal_path: wal_path.clone(), // remove after its done
-                finished: false,
+                sstable: None,
                 memtable: Arc::clone(&frozen),
                 id: tick,
             },
@@ -1924,7 +1957,7 @@ impl KVEngine {
 
         self.flushing_manager.background_flush_memtable(
             FrozenMemtableInstance {
-                finished: false,
+                sstable: None,
                 wal_path,
                 memtable: Arc::clone(&frozen),
                 id: tick,
@@ -2151,6 +2184,94 @@ impl KVEngine {
         } // 
 
         Ok(Some(true))
+    }
+
+    // need a function that checks whether there are any messages from the flushing thread
+    // or from compaction
+    // if yes, we push the new sstables and change state
+    // if no, its just a simple check -> skip
+
+    fn add_sstable_to_l0(&mut self, sstable: SSTable) {
+        if let Some(levels) = &self.sstables {
+            let mut levels = levels.write().unwrap();
+            levels[0].push(sstable);
+            levels[0].sort_by_key(|s| Reverse(s.id));
+        }
+    }
+    fn maintenance(&mut self) -> Result<()> {
+        //
+        // check flushing thread first
+        let mut should_check_for_compaction = false;
+
+        match self.flushing_manager.rx.try_recv() {
+            Ok(msg) => match msg {
+                FlushingThreadResponse::Success { id, sstable } => {
+                    if let Some(frozen_instance) = self.frozen_memtables.get_mut(&id) {
+                        frozen_instance.sstable = Some(sstable);
+                    }
+                }
+                FlushingThreadResponse::Error { id, error } => return Err(error),
+            },
+            Err(_) => {}
+        };
+
+        while let Some(first) = self.frozen_memtables.first_entry() {
+            if first.get().sstable.is_none() {
+                break;
+            }
+            let instance = first.remove();
+            self.add_sstable_to_l0(instance.sstable.unwrap()); // safe unwrap
+            should_check_for_compaction = true;
+            let _ = fs::remove_file(instance.wal_path);
+        }
+
+        // then check compaction
+        if let Some(result) = self.compaction_manager.poll() {
+            match result {
+                Ok(compaction_outcome) => {
+                    let mut outputs = Vec::with_capacity(compaction_outcome.final_sst_files.len());
+                    for (tmp, final_path) in compaction_outcome.final_sst_files {
+                        fs::rename(tmp, &final_path)?;
+                        outputs.push(SSTable::load(&final_path)?);
+                    }
+                    File::open(&self.data_directory)?.sync_all()?;
+                    // need to put new sstables in levels, and also remove compacted sstables in levels
+
+                    if let Some(levels) = &self.sstables {
+                        let mut levels = levels.write().unwrap();
+                        for level in levels.iter_mut() {
+                            level.retain(|ss| {
+                                !compaction_outcome
+                                    .consumed_sst_files
+                                    .contains(&ss.file_path)
+                            });
+                        }
+
+                        for sst in outputs {
+                            levels[sst.level as usize].push(sst);
+                        }
+
+                        for level in levels.iter_mut() {
+                            level.sort_by_key(|s| Reverse(s.id));
+                        }
+                    }
+
+                    for consumed_sst_path in compaction_outcome.consumed_sst_files {
+                        let _ = remove_file(consumed_sst_path);
+                    }
+                    should_check_for_compaction = true;
+                }
+                Err(e) => {
+                    // tmp files already removed
+                    return Err(e);
+                }
+            }
+        }
+
+        if should_check_for_compaction {
+            self.compact()?;
+        }
+        Ok(())
     }
 }
 

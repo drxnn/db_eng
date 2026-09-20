@@ -1,7 +1,9 @@
 mod compact;
+mod compress;
 mod errors;
 mod helpers;
 mod lsm;
+mod manifest;
 
 fn main() {}
 
