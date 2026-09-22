@@ -24,6 +24,7 @@ pub enum CrcType {
     DataBlock,
     WalRecord,
     SstFooterMetadata,
+    ManifestRecord,
 }
 
 #[derive(Debug)]

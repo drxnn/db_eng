@@ -1,55 +1,32 @@
-use std::format;
-use std::fs::File;
-use std::io::Write;
-use std::{collections::BTreeSet, path::PathBuf};
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
 
-use crate::errors::DbError;
-use crate::helpers::CRC32;
+use std::path::Path;
+use std::{collections::BTreeSet, path::PathBuf};
+use std::{format, unimplemented};
+
+use crate::errors::{CorruptionType, CrcType, DataCorruptedErr, DbError};
+use crate::helpers::{CRC32, check_crc, read_range};
 use crate::{errors::Result, lsm::SST_LEVEL_COUNT};
 pub const MAX_MANIFEST_SIZE: u64 = 4 * 1024 * 1024;
 pub const TAG_ADD_FILE: u8 = 1;
 pub const TAG_DELETE_FILE: u8 = 2;
 pub const TAG_MIN_LIVE_WAL: u8 = 3;
-
+pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
+pub const MANIFEST_TMP_FILE_NAME: &str = "MANIFEST.tmp";
 /*
-The Manifest is another append only file that helps us determine the engines state
-// if the engine crashes, we can use the manifest to go back to the correct valid state
-something that can go wrong:
-we havde 10 files to compact, we compact them down to 3 new output files
-// we need to delete the input but we delete the files one by one, if the engine crashes mid way, we will have duplicate data, or we could
-// have leftover inputs that would shadow newer data
-the manifest would fix this because we would append the entire compaction record as one log to the Manifest
-// then we would delete the files, if we have a crash mid way, doesnt matter, we check the manifest to determine what files are live
-
-entry example format: | NEW_FILE(the tag) | level | file_id
-TypeOfEntry: NEW_FILE | DELETED_FILE | MIN_WAL_ID(min wal id basically says "wal files below this id are completely flushed, so if we find any we can safely just delete them, the other wals get retrieved and flushed")
 
 
 NEW_FILE | DELETED_FILE format: | level(1 byte) | file_id(8 bytes)
 
-RECORD format: length(8 bytes) | payload(length bytes) | crc(4) |
-paylod: entry*
-as the manifest files get bigger, we need to compact it as well, the way we do that is we read the current manifest(the in memory one) and we
-write a new manifest with only the live data
-for example, lets say our manifest added a few files, then compaction deleted those files, this manifest has records that are just taking space
-so we make a new one and we put all the current active files in there, our min_wal_id and then its smaller insize because the compaction records that are
-now irrelevant are gone.
-so a manifest file really looks like this: | snapshot | edit_records |
-the snapshot will just be a bunch of NEW_FILE records essentially, no need to distinguish, it still is just a bunch of records(NEW_FILE records)
 
-when you write a change, for example [Deleted L0 #4,Deleted L0 #6,Deleted L0 #1,NEW L1 #12](all one record)
-you write the record to the manifest file first(sync it)
-then you apply this edit to the in memory ManifestState and if the check passes, the caller updates sstables
-methods:
-append_record()
-edit_state()
-edit_and_append(ManifestEdit) // the function we call, calls the other 2 functions above
+LENGTH(8 bytes) | TAG_ADD_FILE(1 byte) | LVL(1) | FILE_ID(8 bytes) | ... | crc(4)(does not cover the length)
 
-
-Records:
-LENGTH(8 bytes) | TAG_ADD_FILE(1 byte) | FILE_ID(8 bytes) | crc(4)
-
-
+record format: length | entry* | crc
+entries:
+wal format: tag | id
+add file format: tag | level | id
+delete file format: tag | level | id
 */
 
 pub struct ManifestEdit {
@@ -66,8 +43,52 @@ pub struct ManifestState {
 
 pub struct ValidatedEdit<'a>(&'a ManifestEdit);
 
+impl Default for ManifestState {
+    fn default() -> Self {
+        Self {
+            levels: [const { BTreeSet::new() }; SST_LEVEL_COUNT],
+            min_live_wal: 0,
+        }
+    }
+}
+
 impl ManifestState {
-    fn edit_state(&mut self, edit: &ValidatedEdit) -> Result<()> {
+    fn new(min_live_wal: u64) -> Self {
+        Self {
+            levels: [const { BTreeSet::new() }; SST_LEVEL_COUNT],
+            min_live_wal,
+        }
+    }
+
+    pub fn replay(bytes: &[u8], path: &Path) -> Result<ManifestState> {
+        let mut starting_state = ManifestState::default();
+        let mut offset: usize = 0;
+
+        while offset < bytes.len() {
+            let byte_to_deserialize = &bytes[offset..];
+            if byte_to_deserialize.len() < 8 {
+                break; // 
+            }
+
+            let length = u64::from_le_bytes(byte_to_deserialize[..8].try_into().unwrap()) as usize;
+            if length > MAX_MANIFEST_SIZE as usize {
+                return Err(DbError::ManifestError(format!(
+                    "record length {length} is larger than the MAX_MANIFEST_SIZE"
+                )));
+            }
+            if 12 + length > byte_to_deserialize.len() {
+                break;
+            }
+
+            let (edit, consumed_bytes) = Manifest::deserialize_record(byte_to_deserialize, &path)?;
+            let validated_edit = starting_state.check_edit_is_compatible_with_state(&edit)?;
+            starting_state.edit_state(&validated_edit);
+            offset += consumed_bytes;
+        }
+
+        Ok(starting_state)
+    }
+    fn edit_state(&mut self, edit: &ValidatedEdit) -> () {
         // should only be called when check_edit_is_compatible_with_state passes
 
         for (lvl, sst_id) in &edit.0.new_files {
@@ -79,7 +100,6 @@ impl ManifestState {
         if let Some(n) = edit.0.min_live_wal {
             self.min_live_wal = n;
         }
-        Ok(())
     }
     fn check_edit_is_compatible_with_state<'a>(
         &self,
@@ -142,9 +162,89 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn recover() {
-        // recover on reopen, make sure to delete files that are not accounted for in the Maifest
+    // if None, open a completely new Manifest
+    pub fn open(dir: &Path) -> Result<Option<Manifest>> {
+        // checks whether we already have a manifest in the directory, if yes, replay it into memory
+        // if no start return None -> start new
+        let path = dir.join(MANIFEST_FILE_NAME);
+        let bytes = match fs::read(dir.join(MANIFEST_FILE_NAME)) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        let state = ManifestState::replay(&bytes, &dir.join(MANIFEST_FILE_NAME))?;
+        let (size, file) = Manifest::write_snapshot(dir, &state)?;
+
+        Ok(Some(Manifest {
+            path,
+            state,
+            dir: dir.to_path_buf(),
+            file,
+            size,
+            read_only: false,
+        }))
     }
+
+    fn write_snapshot(dir: &Path, state: &ManifestState) -> Result<(u64, File)> {
+        // writes all the add_file tags to ManifestState to a tmp file, then the min_wal_id
+        // then atomically rename and sync
+        //
+
+        let tmp = dir.join(MANIFEST_TMP_FILE_NAME);
+        let mut f = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(&tmp)?;
+
+        // finish
+        let snapshot = ManifestEdit {
+            new_files: state
+                .levels
+                .iter()
+                .enumerate()
+                .flat_map(|(lvl, ssts)| ssts.iter().map(move |sst| ((lvl as u8), *sst)))
+                .collect(),
+
+            deleted_files: Vec::new(),
+            min_live_wal: Some(state.min_live_wal),
+        };
+
+        let validated = ManifestState::default().check_edit_is_compatible_with_state(&snapshot)?; // needs empty state so we can add without a confict
+        let full_record = Manifest::serialize_record(&validated);
+        f.write_all(&full_record)?;
+        f.sync_all()?;
+        fs::rename(&tmp, dir.join("MANIFEST"))?;
+        File::open(dir)?.sync_all()?;
+
+        Ok((full_record.len() as u64, f))
+    }
+
+    pub fn new_manifest(dir: &Path) -> Result<Manifest> {
+        // returns empty Manifest(first time db opened)
+        let path = dir.join(MANIFEST_FILE_NAME);
+
+        let f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        File::open(dir)?.sync_all()?;
+        Ok(Manifest {
+            path,
+            state: ManifestState::default(),
+            dir: dir.to_path_buf(),
+            file: f,
+            size: 0,
+            read_only: false,
+        })
+    }
+    pub fn remove_obsolete_files(&self) {
+        // cleans up the directory from unaccounted for files
+        // call during KVEngine::open
+    }
+
+    // fn replay_state(bytes: &[u8]) -> ManifestState {}
     pub fn edit_and_append(&mut self, edit: &ManifestEdit) -> Result<()> {
         if self.read_only {
             return Err(DbError::ManifestError(
@@ -164,7 +264,7 @@ impl Manifest {
             return Err(e.into());
         }
 
-        self.state.edit_state(&validated)?;
+        self.state.edit_state(&validated);
         Ok(())
     }
     pub fn serialize_record(validated_edit: &ValidatedEdit) -> Vec<u8> {
@@ -195,5 +295,82 @@ impl Manifest {
 
         record
     } // takes a record and writes in in bytes
-    pub fn deserialize_record() {} // reads bytes of a record and returns a ManifestEdit, so on reboot, we call on each record to build ManifestState
+    pub fn deserialize_record(bytes: &[u8], path: &Path) -> Result<(ManifestEdit, usize)> {
+        // so we read a record: length | payload | crc and return an edit so we can build state
+
+        let length = u64::from_le_bytes(read_range(bytes, 0, 8)?.try_into().unwrap());
+        if length > MAX_MANIFEST_SIZE {
+            return Err(DbError::ManifestError(format!(
+                "Record found in Manifest exceeds max manifest size. Length found: {length}"
+            )));
+        }
+
+        let mut new_files: Vec<(u8, u64)> = Vec::new();
+        let mut deleted_files: Vec<(u8, u64)> = Vec::new();
+        let mut wal_id: Option<u64> = None;
+        let payload = read_range(bytes, 8, 8 + length as usize)?;
+        let crc_to_check = CRC32.compute_crc_data_block(payload);
+        let crc_in_file = u32::from_le_bytes(
+            read_range(
+                bytes,
+                (8 + length as usize) as usize,
+                (8 + length as usize) + 4,
+            )?
+            .try_into()
+            .unwrap(),
+        );
+
+        check_crc(crc_to_check, crc_in_file, 8, &path, CrcType::ManifestRecord)?;
+        let mut pos: usize = 0;
+
+        while pos < payload.len() {
+            let tag = u8::from_le_bytes(read_range(payload, pos, (pos + 1))?.try_into().unwrap());
+            pos += 1;
+            match tag {
+                TAG_ADD_FILE => {
+                    let lvl =
+                        u8::from_le_bytes(read_range(payload, pos, (pos + 1))?.try_into().unwrap());
+                    pos += 1;
+                    let sst_id = u64::from_le_bytes(
+                        read_range(payload, pos, (pos + 8))?.try_into().unwrap(),
+                    );
+                    pos += 8;
+                    new_files.push((lvl, sst_id));
+                }
+                TAG_DELETE_FILE => {
+                    let lvl =
+                        u8::from_le_bytes(read_range(payload, pos, (pos + 1))?.try_into().unwrap());
+                    pos += 1;
+                    let sst_id = u64::from_le_bytes(
+                        read_range(payload, pos, (pos + 8))?.try_into().unwrap(),
+                    );
+                    pos += 8;
+                    deleted_files.push((lvl, sst_id));
+                }
+                TAG_MIN_LIVE_WAL => {
+                    let w_id = u64::from_le_bytes(
+                        read_range(payload, pos, (pos + 8))?.try_into().unwrap(),
+                    );
+                    pos += 8;
+                    wal_id = Some(w_id);
+                }
+                found => {
+                    return Err(DbError::DataCorrupted(DataCorruptedErr {
+                        offset: 8 + pos as u64 - 1,
+                        file_path: path.to_path_buf(),
+                        reason: CorruptionType::RecordTypeCorrupted { found },
+                    }));
+                }
+            }
+        }
+
+        Ok((
+            ManifestEdit {
+                new_files,
+                deleted_files,
+                min_live_wal: wal_id,
+            },
+            pos + 4 + 8, // for the crc and length
+        ))
+    } // reads bytes of a record and returns a ManifestEdit, so on reboot, we call on each record to build ManifestState
 }

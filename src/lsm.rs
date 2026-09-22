@@ -26,6 +26,7 @@ use crate::helpers::{
 };
 use crate::lsm::Lookup::{Absent, Deleted, Found};
 use crate::lsm::SyncConfig::{Always, Every};
+use crate::manifest::Manifest;
 
 use std::cmp::{Ordering as CmpOrdering, Reverse, max};
 
@@ -96,10 +97,6 @@ so it can look like:
 RECORD_LEN | (RECORD_TYPE | RECORD)* | CRC
  |
 */
-pub struct Manifest {
-    path: PathBuf,
-    writer: BufWriter<File>,
-}
 
 impl SparseIndex {
     pub fn new() -> Self {
@@ -1055,7 +1052,7 @@ impl AVL {
         let (file, ss_path_tmp, ss_path_final) = create_new_data_file(dir, hlc)?;
         let tmp_path_for_err_case = ss_path_tmp.clone();
 
-        // TODO LATER: Have a Manifest file that just keeps track of what files are active and if a file isnt in the Manifest it gets deleted.
+        // TODO LATER: Have a Manifest file that just keeps track of what files are active and if a file iƒt in the Manifest it gets deleted.
         (|| -> Result<Option<(File, PathBuf, PathBuf)>> {
             // TODO: Can also put in a function
             let mut writer = BufWriter::new(file);
@@ -1451,6 +1448,7 @@ struct KVEngine {
     hlc: Arc<Hlc>, // first 52 bits are the time stamp, 12 last bits are the counter
     compaction_manager: CompactionManager,
     wal_failed: bool,
+    manifest: Manifest,
 }
 
 pub struct Hlc {
@@ -1567,11 +1565,20 @@ impl KVEngine {
         // IMPORTANT: The new wal is created after we check the actual directory for wal files.
         // This is important because we do not want to call retrieve_wal_records() on the new empty wal
 
+        let manifest = match Manifest::open(&path) {
+            Ok(Some(man)) => man,
+
+            Ok(None) => Manifest::new_manifest(&path)?,
+
+            Err(e) => return Err(e),
+        };
+
         let mut self_instance = Self {
             data_directory: path,
             sync_config,
             memtable,
             sstables: None,
+            manifest,
             wal,
             frozen_memtables: BTreeMap::new(),
             flushing_manager: FlushingManager::new(),

@@ -16,8 +16,6 @@ use std::{
     path::PathBuf,
 };
 
-use crc::{CRC_32_ISO_HDLC, Crc};
-
 use crate::errors::CompactionErr::{self};
 
 use crate::errors::CrcType;
