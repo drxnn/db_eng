@@ -176,13 +176,13 @@ pub fn find_max_hlc_between_files(path_bufs: &[PathBuf]) -> Option<u64> {
 }
 
 // dir should be a constant not passed since Im using it for ssts only or make it so it takes a type of file to create
-pub fn create_new_data_file(dir: &Path, hlc: u64) -> io::Result<(File, PathBuf, PathBuf)> {
-    let data_file_path_final = dir.join(format!("{}.sst", hlc));
-    let data_file_path_tmp = dir.join(format!("{}.sst.tmp", hlc));
+pub fn create_new_data_file(dir: &Path, hlc: u64) -> io::Result<(File, PathBuf)> {
+    let data_file_path = dir.join(format!("{}.sst", hlc));
+
     let data_file = OpenOptions::new()
         .read(true)
         .append(true)
         .create_new(true)
-        .open(&data_file_path_tmp)?;
-    Ok((data_file, data_file_path_tmp, data_file_path_final))
+        .open(&data_file_path)?;
+    Ok((data_file, data_file_path))
 }

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread::{JoinHandle, spawn};
 
-use std::mem;
+use std::{format, mem};
 use std::{
     fs::File,
     io::{BufReader, BufWriter},
@@ -34,18 +34,20 @@ use crate::{
 //Comes from SSTable struct
 pub struct CompactionSstSlice {
     file_path: PathBuf,
+    id: u64,
     sparse_index: Arc<Vec<(Vec<u8>, u64, u64)>>,
     sparse_index_curr_position: usize,
     level: u8,
 }
 
 struct SstFinalizer {
+    id: u64,
     level: u8,
     writer: BufWriter<File>,
     hashed_keys: Vec<u128>,
     sparse_index: SparseIndex,
     data_block: SsTableDataBlock,
-    sst_paths: (PathBuf, PathBuf), // file that Bufwriter holds
+    sst_path: PathBuf, // file that Bufwriter holds
     offset: u64,
     min_key: Vec<u8>, // max_key can be obtained by doing data_block.grab_max_key() at the end
     bytes_written_to_file: u64,
@@ -64,16 +66,17 @@ impl SstFinalizer {
         // output gets placed in L(n+1)
         // in L0, compact every L0 wit every L1 sst
         //
-
-        let (file, tmp_file, final_file) = create_new_data_file(dir, hlc.tick())?;
+        let id: u64 = hlc.tick();
+        let (file, final_file) = create_new_data_file(dir, id)?;
         let writer = BufWriter::new(file);
         Ok(Self {
+            id,
             writer,
             hashed_keys: Vec::new(),
             sparse_index: SparseIndex::new(),
             data_block: SsTableDataBlock::new(&starting_key),
             min_key: starting_key,
-            sst_paths: (tmp_file, final_file),
+            sst_path: final_file,
             offset: 0,
             bytes_written_to_file: 0,
             level: lvl,
@@ -86,8 +89,14 @@ impl SstFinalizer {
 }
 
 impl CompactionSstSlice {
-    pub fn new(file_path: PathBuf, sparse_index: Arc<Vec<(Vec<u8>, u64, u64)>>, level: u8) -> Self {
+    pub fn new(
+        file_path: PathBuf,
+        id: u64,
+        sparse_index: Arc<Vec<(Vec<u8>, u64, u64)>>,
+        level: u8,
+    ) -> Self {
         Self {
+            id,
             file_path,
             sparse_index,
             sparse_index_curr_position: 0,
@@ -404,8 +413,8 @@ pub struct CompactionJob {
 
 #[derive(Default)]
 pub struct CompactionOutcome {
-    pub final_sst_files: Vec<(PathBuf, PathBuf)>, // (tmp_file, final_file). Tmp holds the data, atomically rename to final, tmp is necessary in case of an error during cmpt
-    pub consumed_sst_files: Vec<PathBuf>,         // files that were completely merged
+    pub final_sst_files: Vec<u64>, // changed to u64(file id) because thats what Manifest wants
+    pub consumed_sst_files: Vec<(u8, u64)>, // files that were completely merged
     pub level_for_output_sst: u8, // files were skipped because they threw an error during new(), data is most likely corrupted, main can decide what to do with these depending on the error, maybe the File::open() failed for some reason which doesnt mean data is corrupted
 }
 
@@ -441,6 +450,7 @@ impl CompactionJob {
             hlc,
             level_for_output_sst,
         } = self;
+        let data_dir_for_err_case = data_dir.clone();
         let mut cmpt_outcome = CompactionOutcome::new(level_for_output_sst);
         let mut cfe_vec: Vec<CompactionFileElement> = Vec::with_capacity(files.len());
 
@@ -457,7 +467,7 @@ impl CompactionJob {
                         } else {
                             cmpt_outcome
                                 .consumed_sst_files
-                                .push(cfe.sst_slice.file_path.clone());
+                                .push((cfe.sst_slice.level, cfe.sst_slice.id));
                         }
                     }
                     Err(e) => return Err(e),
@@ -471,15 +481,15 @@ impl CompactionJob {
         match result {
             Ok(()) => Ok(cmpt_outcome),
             Err(e) => {
-                for (tmp, _) in &cmpt_outcome.final_sst_files {
-                    let _ = fs::remove_file(tmp);
+                for file_id in &cmpt_outcome.final_sst_files {
+                    let _ = fs::remove_file(data_dir_for_err_case.join(format!("{file_id}.sst"))); // remove all of them
                 }
                 Err(e)
             }
         }
     }
 
-    fn finalize_output_merged_file(mut sst_finalizer: SstFinalizer) -> Result<(())> {
+    fn finalize_output_merged_file(mut sst_finalizer: SstFinalizer) -> Result<()> {
         // return final.sst
 
         let len = sst_finalizer.data_block.bytes.get_ref().len() as u64;
@@ -557,9 +567,8 @@ impl CompactionJob {
             &hlc,
             compaction_outcome.level_for_output_sst,
         )?;
-        compaction_outcome
-            .final_sst_files
-            .push(sst_finalizer.sst_paths.clone());
+
+        compaction_outcome.final_sst_files.push(sst_finalizer.id);
         let mut last_k_written: Option<Vec<u8>> = None;
 
         while let Some(curr_merge_item) = heap.pop().as_mut() {
@@ -574,9 +583,7 @@ impl CompactionJob {
                         &hlc,
                         compaction_outcome.level_for_output_sst,
                     )?; // after 160MB, one sst is done // 
-                    compaction_outcome
-                        .final_sst_files
-                        .push(sst_finalizer.sst_paths.clone());
+                    compaction_outcome.final_sst_files.push(sst_finalizer.id);
                 }
 
                 sst_finalizer
@@ -617,17 +624,15 @@ impl CompactionJob {
                 "source index is always valid: cfe_vec is append-only and idx is assigned pre push",
             ); // TODO: dont expect anyways, just throw err
             // if item is the same as last one, we are skipping it because the newer key has already been written to final file
-            MergeItem::new(cfe, curr_merge_item.0.source).map(|x| {
-                match x {
-                    Some(m) => heap.push(Reverse(m)),
-                    None => {
-                        compaction_outcome
-                            .consumed_sst_files
-                            .push(cfe.sst_slice.file_path.clone());
-                        // DATA BLOCK EXHAUSTED -> fully_consumed vec
-                    } // if this returns none, file has been fully read and we push it to the fully_consumed_file vector
-                }
-            })?; // err
+            match MergeItem::new(cfe, curr_merge_item.0.source)? {
+                Some(m) => heap.push(Reverse(m)),
+                None => {
+                    compaction_outcome
+                        .consumed_sst_files
+                        .push((cfe.sst_slice.level, cfe.sst_slice.id));
+                    // DATA BLOCK EXHAUSTED -> fully_consumed vec
+                } // if this returns none, file has been fully read and we push it to the fully_consumed_file vector
+            }; // err
         }
 
         Self::finalize_output_merged_file(sst_finalizer)?;

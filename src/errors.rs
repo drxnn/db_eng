@@ -79,6 +79,7 @@ pub enum DbError {
     MemTableSyncError(String),
     ReportedViaChannel,
     SyncFail(Box<DbError>, PathBuf),
+    ReadOnly(String),
     WalFailed,
     CompactionError(CompactionErr),
     DataBlockExhausted,
@@ -315,6 +316,9 @@ impl fmt::Display for DbError {
             }
             Self::ManifestError(s) => {
                 write!(f, "Manifest Err. Msg: {}", s)
+            }
+            Self::ReadOnly(s) => {
+                write!(f, "Database in read only mode. Err Msg: {}", s)
             }
         }
     }

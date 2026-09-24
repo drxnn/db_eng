@@ -153,12 +153,12 @@ impl ManifestState {
     }
 }
 pub struct Manifest {
-    path: PathBuf,
-    state: ManifestState,
-    dir: PathBuf,
-    file: File,
-    size: u64,
-    read_only: bool, // if we have a failure like disk full or hardware
+    pub path: PathBuf,
+    pub state: ManifestState,
+    pub dir: PathBuf,
+    pub file: File,
+    pub size: u64,
+    pub read_only: bool, // if we have a failure like disk full or hardware
 }
 
 impl Manifest {
@@ -255,11 +255,10 @@ impl Manifest {
 
         let record = Self::serialize_record(&validated);
         // write to self.file and sync it
-        if let Err(e) = self
-            .file
-            .write_all(&record)
-            .and_then(|_| self.file.sync_all())
-        {
+        if let Err(e) = self.file.write_all(&record).and_then(|_| {
+            self.size += record.len() as u64;
+            self.file.sync_all()
+        }) {
             self.read_only = true;
             return Err(e.into());
         }

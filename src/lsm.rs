@@ -12,21 +12,21 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::thread::spawn;
 use std::time::{Duration, Instant};
-use std::unreachable;
+use std::{format, unreachable};
 
 use crate::compact::{CompactionJob, CompactionManager, CompactionSstSlice};
 use crate::errors::CorruptionType::{Other, SstLevelMalformed};
 use crate::errors::{
     CorruptionType, CrcType, DataCorruptedErr, DbError, InvalidMemtableInput, Result,
 };
-use crate::helpers::CRC32;
+use crate::helpers::{CRC32, get_hlc_from_valid_pathbuf};
 use crate::helpers::{
     NUM_HASHES, check_crc, create_new_data_file, find_max_hlc_between_files,
     get_hashed_key_positions, new_timestamp, read_exact_or_corrupt, read_range,
 };
 use crate::lsm::Lookup::{Absent, Deleted, Found};
 use crate::lsm::SyncConfig::{Always, Every};
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, ManifestEdit};
 
 use std::cmp::{Ordering as CmpOrdering, Reverse, max};
 
@@ -36,7 +36,7 @@ const MEMTABLE_THRESHOLD: u64 = 8 * 1024 * 1024; // SUBJECT TO CHANGE
 const DATA_BLOCK: u16 = 8 * 1024; // Data block in SSTable
 pub const DATA_BLOCK_MAX_BYTES_SIZE: u64 = 155673; // 8192(max db_size) + KEY_MAX_BYTES_SIZE + VALUE_MAX_BYTES_SIZE + 25 bytes for metadata(timestamp, ksz,vsz,tmbstone); // if we had a db_size of 8191, we could end up with adding a max val and max key
 // const MAX_BLOCK_SIZE: u64 = 1024 * 1024;
-pub const MAX_SST_SIZE: u64 = 1024 * 1024 * 160;
+pub const MAX_SST_SIZE: u64 = 1024 * 1024 * 100;
 const TAG_DELETION: u8 = 2;
 const TAG_INSERTION: u8 = 4;
 pub const SST_LEVEL_COUNT: usize = 4;
@@ -52,6 +52,7 @@ pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L2_COMPACTION: u64 = MAX_SST_SIZE * 100
 pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L3_COMPACTION: u64 = MAX_SST_SIZE * 1000;
 pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L4_COMPACTION: u64 = MAX_SST_SIZE * 10000;
 pub const DEFAULT_DATA_DIR: &str = "data";
+pub const MAX_FLUSH_ATTEMPTS: u8 = 5;
 
 // WAL config for flush
 
@@ -202,6 +203,7 @@ impl BloomFilter {
 }
 
 struct WAL {
+    id: u64,
     wal_writer: Option<BufWriter<File>>,
     sync_c: SyncConfig,
     record_buffer: Vec<u8>,
@@ -225,6 +227,7 @@ impl WAL {
             .create(true)
             .open(&wal_path)?;
         Ok(Self {
+            id: curr_hlc,
             wal_writer: Some(BufWriter::new(wal_file)),
             threshold,
             record_buffer: Vec::new(),
@@ -1038,7 +1041,7 @@ impl AVL {
         Ok(())
     }
 
-    fn sync_avl(&self, dir: &Path, hlc: u64) -> Result<Option<(File, PathBuf, PathBuf)>> {
+    fn sync_avl(&self, dir: &Path, hlc: u64) -> Result<Option<(File, PathBuf)>> {
         let min_k = match Self::get_min_node(&self.root) {
             Some(k) => &k.entry.key,
             None => return Ok(None),
@@ -1049,11 +1052,11 @@ impl AVL {
             None => return Ok(None),
         };
 
-        let (file, ss_path_tmp, ss_path_final) = create_new_data_file(dir, hlc)?;
-        let tmp_path_for_err_case = ss_path_tmp.clone();
+        let (file, ss_path_final) = create_new_data_file(dir, hlc)?;
+        let tmp_path_for_err_case = ss_path_final.clone();
 
         // TODO LATER: Have a Manifest file that just keeps track of what files are active and if a file iƒt in the Manifest it gets deleted.
-        (|| -> Result<Option<(File, PathBuf, PathBuf)>> {
+        (|| -> Result<Option<(File, PathBuf)>> {
             // TODO: Can also put in a function
             let mut writer = BufWriter::new(file);
             //
@@ -1120,14 +1123,14 @@ impl AVL {
             let f = writer.into_inner().map_err(|e| {
                 DbError::FileError(
                     format!("Failed to extract File from BufWriter: {}", e.error()),
-                    ss_path_tmp.to_path_buf(),
+                    ss_path_final.to_path_buf(),
                 )
             })?;
             f.sync_all()?;
 
-            fs::rename(&ss_path_tmp, &ss_path_final)?;
+            // fs::rename(&ss_path_tmp, &ss_path_final)?; // unecessary now
 
-            Ok(Some((f, ss_path_tmp, ss_path_final)))
+            Ok(Some((f, ss_path_final)))
         })()
         .map_err(|err| {
             let _ = fs::remove_file(&tmp_path_for_err_case);
@@ -1176,7 +1179,7 @@ impl FlushingManager {
         let id = frozen_instance.id;
         spawn(move || -> Result<()> {
             let result = (|| -> Result<SSTable> {
-                let (_, f, ss_path_final) = frozen_instance
+                let (_, ss_path_final) = frozen_instance
                     .memtable
                     .sync_avl(&dir, frozen_instance.id)?
                     .ok_or_else(|| {
@@ -1389,19 +1392,20 @@ impl FlushingManager {
         };
         hlc.recover_to(max_hlc);
 
-        if dir.join(format!("{max_hlc}.sst")).exists() {
-            // in case the wal was already retrived but engine crashed before removing the file
-            let _ = fs::remove_file(path);
-            return Ok(None);
-        }
-        let (f, _, ss_final_path) = match replay.memtable.sync_avl(dir, max_hlc) {
-            Ok(Some((f, tmp_file, ss_final_path))) => {
+        // if dir.join(format!("{max_hlc}.sst")).exists() {
+        //     // in case the wal was already retrived but engine crashed before removing the file
+        //     // this shouild not be needed anymore ( we use min_live_wal)
+        //     let _ = fs::remove_file(path);
+        //     return Ok(None);
+        // }
+        let (f, ss_final_path) = match replay.memtable.sync_avl(dir, max_hlc) {
+            Ok(Some((f, ss_final_path))) => {
                 if let Some(dir) = ss_final_path.parent() {
                     // always should have parent
                     File::open(dir)?.sync_all()?;
                 }
 
-                (f, tmp_file, ss_final_path)
+                (f, ss_final_path)
             }
             Err(DbError::SyncFail(err, path)) => {
                 let _ = fs::remove_file(&path);
@@ -1421,7 +1425,6 @@ impl FlushingManager {
         };
 
         let sstable = SSTable::load(&ss_final_path)?;
-        let _ = fs::remove_file(path);
 
         Ok(Some(sstable))
     }
@@ -1431,7 +1434,8 @@ struct FrozenMemtableInstance {
     memtable: Arc<AVL>,
     sstable: Option<SSTable>, // it should hold sstables until it is safe for it to be retired(when after every older memtable is gone from the BtreeMap)
     id: u64,                  // hlc
-    wal_path: PathBuf,
+    wal_id: u64,
+    flush_attempts: u8,
 }
 // TODO:
 struct KVEngine {
@@ -1447,7 +1451,7 @@ struct KVEngine {
     flushing_manager: FlushingManager,
     hlc: Arc<Hlc>, // first 52 bits are the time stamp, 12 last bits are the counter
     compaction_manager: CompactionManager,
-    wal_failed: bool,
+    db_failed: Option<String>, //
     manifest: Manifest,
 }
 
@@ -1518,18 +1522,18 @@ impl Hlc {
 impl KVEngine {
     // threshold and sync_config can be part of one config struct later.
     fn open(dir_name: &Path, sync_config: SyncConfig) -> Result<KVEngine> {
-        // TODO: Put the actual directory somewhere specific not in the working dir
         let path = PathBuf::from(dir_name);
 
         let mut sstables: [Vec<SSTable>; SST_LEVEL_COUNT] = [const { Vec::new() }; SST_LEVEL_COUNT];
 
         let memtable = AVL::new(MEMTABLE_THRESHOLD);
 
-        let mut sst_vec: Vec<PathBuf> = Vec::new();
-        let mut wal_vec: Vec<PathBuf> = Vec::new();
+        let mut sst_vec: Vec<(u64, PathBuf)> = Vec::new();
+        let mut wal_vec: Vec<(u64, PathBuf)> = Vec::new();
 
         // sort by
         for entry in fs::read_dir(dir_name)? {
+            //
             let entry = entry?;
             let path = entry.path();
             if !path.is_file() {
@@ -1537,41 +1541,58 @@ impl KVEngine {
             }
 
             match path.extension().and_then(|x| x.to_str()) {
-                Some(e) => match e {
-                    "sst" => {
-                        sst_vec.push(path);
+                Some("sst") => {
+                    if let Ok(id) = get_hlc_from_valid_pathbuf(&path) {
+                        sst_vec.push((id, path));
                     }
-                    "wal" => {
-                        wal_vec.push(path);
+                }
+                Some("wal") => {
+                    if let Ok(id) = get_hlc_from_valid_pathbuf(&path) {
+                        wal_vec.push((id, path));
                     }
-                    "tmp" => {
-                        let _ = remove_file(path); // unfinished sync
-                    }
-                    _ => {}
-                },
-                _ => continue,
+                }
+                Some("tmp") => {
+                    // incomplete manifest
+                    let _ = remove_file(path);
+                }
+                _ => {}
             };
         }
 
-        let max_hlc_from_ssts = find_max_hlc_between_files(sst_vec.as_slice()).unwrap_or(0);
+        let manifest = match Manifest::open(dir_name)? {
+            Some(m) => m,
+            None if !sst_vec.is_empty() => {
+                return Err(DbError::ManifestError(
+                    "no MANIFEST, but .sst files exist".into(),
+                ));
+            }
+            None => Manifest::new_manifest(dir_name)?,
+            // what if we dont have a manifest but we have sst files? we should reject
+        };
 
-        // I have wal_paths, with data that needs to be synced as ssts.
-        //
+        let max_hlc = sst_vec
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(wal_vec.iter().map(|(id, _)| *id))
+            .max()
+            .unwrap_or(0);
+
+        let (live_ssts, obsolete_ssts): (Vec<(u64, PathBuf)>, Vec<(u64, PathBuf)>) =
+            sst_vec.into_iter().partition(|(id, _)| {
+                for level in &manifest.state.levels {
+                    if level.contains(id) {
+                        return true;
+                    }
+                }
+                return false;
+            });
 
         let hlc = Hlc::new();
 
-        hlc.recover_to(max_hlc_from_ssts);
+        hlc.recover_to(max_hlc);
         let wal = WAL::new(MEMTABLE_THRESHOLD, sync_config, &path, hlc.tick())?;
         // IMPORTANT: The new wal is created after we check the actual directory for wal files.
         // This is important because we do not want to call retrieve_wal_records() on the new empty wal
-
-        let manifest = match Manifest::open(&path) {
-            Ok(Some(man)) => man,
-
-            Ok(None) => Manifest::new_manifest(&path)?,
-
-            Err(e) => return Err(e),
-        };
 
         let mut self_instance = Self {
             data_directory: path,
@@ -1585,10 +1606,10 @@ impl KVEngine {
             corrupted_files: HashSet::new(),
             hlc: Arc::new(hlc),
             compaction_manager: CompactionManager::new(),
-            wal_failed: false,
+            db_failed: None,
         };
 
-        for path in sst_vec {
+        for (_, path) in live_ssts {
             match SSTable::load(&path) {
                 Ok(sst) => {
                     sstables[sst.level as usize].push(sst);
@@ -1632,22 +1653,17 @@ impl KVEngine {
             }
         }
 
-        let mut wal_vec = wal_vec
+        let (mut wals_to_replay, obsolete_wals): (Vec<_>, Vec<_>) = wal_vec
             .into_iter()
-            .filter(|x| {
-                x.file_stem()
-                    .and_then(|x| x.to_str())
-                    .and_then(|x| x.parse::<u64>().ok())
-                    .is_some()
-            })
-            .collect::<Vec<PathBuf>>();
+            .partition(|(id, _)| *id >= self_instance.manifest.state.min_live_wal);
 
-        wal_vec.sort_by_key(|x| {
-            x.file_stem()
-                .and_then(|x| x.to_str())
-                .map(|x| x.parse::<u64>().ok())
-        });
-        for path in wal_vec {
+        //TODO probbably have the manifest do this instead
+        for (_, path) in obsolete_ssts.into_iter().chain(obsolete_wals) {
+            let _ = remove_file(path);
+        }
+
+        wals_to_replay.sort_by_key(|(id, path)| *id);
+        for (id, path) in wals_to_replay {
             // wal populates this and we flush it to disk as an .sst
 
             match self_instance.flushing_manager.retrieve_wal_records(
@@ -1655,15 +1671,18 @@ impl KVEngine {
                 &self_instance.data_directory,
                 &self_instance.hlc,
             ) {
-                // TIHS SHOULD ANTICIPATE THE SPARSE_INDEX_CRC_MISMATCH FAILURE IN THE FUTURE
-                // WHERE WE WILL REBUILD THE SSTABLE
-                // FOR NOW, IF IT FAILS WE DONT PUSH SST
                 Ok(Some(ss)) => {
+                    self_instance.manifest.edit_and_append(&ManifestEdit {
+                        new_files: vec![(0, ss.id)],
+                        deleted_files: vec![],
+                        min_live_wal: Some(id + 1), // fix
+                    })?;
                     if ss.level < SST_LEVEL_COUNT as u8 {
                         sstables[ss.level as usize].push(ss);
                     } else {
                         self_instance.corrupted_files.insert(ss.file_path);
                     }
+                    let _ = remove_file(path);
                 }
                 Err(e) => return Err(e),
                 Ok(None) => continue,
@@ -1856,8 +1875,8 @@ impl KVEngine {
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        if self.wal_failed {
-            return Err(DbError::WalFailed);
+        if let Some(err_msg) = &self.db_failed {
+            return Err(DbError::ReadOnly(err_msg.to_string())); // maybe put the message in the Error
         }
         self.memtable
             .exceeds_max(key.len() as u64, value.len() as u64)?;
@@ -1879,7 +1898,11 @@ impl KVEngine {
                 // in that case subsequent writes will also fail so we stop accepting writes
                 // how to handle? check what other dbs do but no need to go too far into it
 
-                self.wal_failed = true;
+                self.fail(format!(
+                    "WAL append failed, so writes can no longer be made durable. \
+     Reopen the database to recover: {e}"
+                ));
+
                 return Err(e);
             }
         }
@@ -1890,8 +1913,8 @@ impl KVEngine {
     }
 
     fn delete(&mut self, key: &[u8]) -> Result<()> {
-        if self.wal_failed {
-            return Err(DbError::WalFailed);
+        if let Some(err_str) = &self.db_failed {
+            return Err(DbError::ReadOnly(err_str.to_string()));
         }
         let k_len = key.len() as u64;
         self.memtable.exceeds_max(k_len, 0)?;
@@ -1903,7 +1926,10 @@ impl KVEngine {
         match self.wal.record_to_wal(WalRecordType::Deletion(key), hlc) {
             Ok(()) => {}
             Err(e) => {
-                self.wal_failed = true;
+                self.fail(format!(
+    "WAL append failed while recording a delete, so writes can no longer be made durable. \
+     Reopen the database to recover: {e}"
+));
                 return Err(e);
             }
         }
@@ -1922,7 +1948,7 @@ impl KVEngine {
                 self.hlc.tick(),
             )?,
         );
-        let wal_path = old_wal.path.clone();
+        let wal_id = old_wal.id;
         drop(old_wal);
 
         // WHEN MAIN(whoever polls it) RECEIVES A SUCCESSFUL FLUSH, REMOVE THE OLD WAL ASSOCIATED WITH THAT FLUSH
@@ -1955,19 +1981,21 @@ impl KVEngine {
         frozen_mems.insert(
             tick,
             FrozenMemtableInstance {
-                wal_path: wal_path.clone(), // remove after its done
+                wal_id, // remove after its done
                 sstable: None,
                 memtable: Arc::clone(&frozen),
                 id: tick,
+                flush_attempts: 0,
             },
         );
 
         self.flushing_manager.background_flush_memtable(
             FrozenMemtableInstance {
                 sstable: None,
-                wal_path,
+                wal_id,
                 memtable: Arc::clone(&frozen),
                 id: tick,
+                flush_attempts: 0,
             },
             self.data_directory.clone(),
             tick,
@@ -2035,6 +2063,7 @@ impl KVEngine {
                 .map(|x| {
                     CompactionSstSlice::new(
                         x.file_path.clone(),
+                        x.id,
                         Arc::clone(&x.sparse_index),
                         x.level,
                     )
@@ -2151,6 +2180,7 @@ impl KVEngine {
                     .map(|x| {
                         CompactionSstSlice::new(
                             x.file_path.clone(),
+                            x.id,
                             Arc::clone(&x.sparse_index),
                             x.level,
                         )
@@ -2208,50 +2238,105 @@ impl KVEngine {
     fn maintenance(&mut self) -> Result<()> {
         //
         // check flushing thread first
+
+        if let Some(error_str) = &self.db_failed {
+            return Err(DbError::ReadOnly(error_str.to_string()));
+        }
         let mut should_check_for_compaction = false;
 
-        match self.flushing_manager.rx.try_recv() {
-            Ok(msg) => match msg {
+        if let Ok(msg) = self.flushing_manager.rx.try_recv() {
+            match msg {
                 FlushingThreadResponse::Success { id, sstable } => {
                     if let Some(frozen_instance) = self.frozen_memtables.get_mut(&id) {
                         frozen_instance.sstable = Some(sstable);
                     }
                 }
-                FlushingThreadResponse::Error { id, error } => return Err(error),
-            },
-            Err(_) => {}
+                FlushingThreadResponse::Error { id, error } => {
+                    if let Some(instance) = self.frozen_memtables.get_mut(&id) {
+                        instance.flush_attempts += 1;
+                        if instance.flush_attempts <= MAX_FLUSH_ATTEMPTS {
+                            let _ = fs::remove_file(self.data_directory.join(format!("{id}.sst")));
+                            self.flushing_manager.background_flush_memtable(
+                                FrozenMemtableInstance {
+                                    memtable: instance.memtable.clone(),
+                                    sstable: instance.sstable.take(),
+                                    id: instance.id,
+                                    wal_id: instance.wal_id,
+                                    flush_attempts: instance.flush_attempts,
+                                },
+                                self.data_directory.clone(),
+                                instance.id,
+                            )?;
+                        } else {
+                            self.fail(format!("memtable {id} failed to flush after {MAX_FLUSH_ATTEMPTS} attempts. \
+                                            No later memtable can retire behind it, so memory will keep growing. \
+                                            Its data is still in its WAL and will be recovered on reopen: {error}"));
+                            return Err(error);
+                        }
+                    }
+                } // use self.fail here but retry first
+            }
         };
 
         while let Some(first) = self.frozen_memtables.first_entry() {
-            if first.get().sstable.is_none() {
+            let Some(sst_id) = first.get().sstable.as_ref().map(|sst| sst.id) else {
                 break;
-            }
+            };
+
             let instance = first.remove();
+            let wal_id = instance.wal_id;
+            if let Err(e) = self.manifest.edit_and_append(&ManifestEdit {
+                new_files: vec![(0, sst_id)],
+                deleted_files: vec![],
+                min_live_wal: Some(wal_id + 1),
+            }) {
+                self.frozen_memtables.insert(instance.id, instance); // put it back on failure or we lose access to it from first.remove() ^
+                self.fail(format!(
+                    "manifest commit failed for the flush of sst {sst_id} (wal {wal_id}), \
+                 so no flush can be published and memtables cannot retire. \
+                  The WAL is intact and replays on reopen: {e}"
+                ));
+                return Err(e);
+            }
+
             self.add_sstable_to_l0(instance.sstable.unwrap()); // safe unwrap
             should_check_for_compaction = true;
-            let _ = fs::remove_file(instance.wal_path);
+            let _ = fs::remove_file(self.data_directory.join(format!("{}.wal", wal_id)));
         }
 
         // then check compaction
         if let Some(result) = self.compaction_manager.poll() {
+            //
             match result {
                 Ok(compaction_outcome) => {
+                    let edit = ManifestEdit {
+                        new_files: compaction_outcome
+                            .final_sst_files
+                            .iter()
+                            .map(|x| (compaction_outcome.level_for_output_sst, *x))
+                            .collect(),
+                        deleted_files: compaction_outcome.consumed_sst_files.clone(),
+                        min_live_wal: None,
+                    };
+
                     let mut outputs = Vec::with_capacity(compaction_outcome.final_sst_files.len());
-                    for (tmp, final_path) in compaction_outcome.final_sst_files {
-                        fs::rename(tmp, &final_path)?;
-                        outputs.push(SSTable::load(&final_path)?);
+                    for file_id in compaction_outcome.final_sst_files {
+                        // fs::rename(tmp, &final_path)?;
+                        outputs.push(SSTable::load(
+                            &self.data_directory.join(format!("{file_id}.sst")),
+                        )?);
                     }
                     File::open(&self.data_directory)?.sync_all()?;
-                    // need to put new sstables in levels, and also remove compacted sstables in levels
+                    if let Err(e) = self.manifest.edit_and_append(&edit) {
+                        self.fail(format!( "manifest commit failed for the compaction into L{}, so its outputs cannot be published. \
+                        The inputs are still live and the outputs are cleaned up on reopen: {e}", compaction_outcome.level_for_output_sst ));
+                        return Err(e);
+                    }
 
                     if let Some(levels) = &self.sstables {
                         let mut levels = levels.write().unwrap();
                         for level in levels.iter_mut() {
-                            level.retain(|ss| {
-                                !compaction_outcome
-                                    .consumed_sst_files
-                                    .contains(&ss.file_path)
-                            });
+                            level.retain(|ss| !edit.deleted_files.contains(&(ss.level, ss.id)));
                         }
 
                         for sst in outputs {
@@ -2263,13 +2348,12 @@ impl KVEngine {
                         }
                     }
 
-                    for consumed_sst_path in compaction_outcome.consumed_sst_files {
-                        let _ = remove_file(consumed_sst_path);
+                    for (_, sst_id) in compaction_outcome.consumed_sst_files {
+                        let _ = remove_file(self.data_directory.join(format!("{sst_id}.sst")));
                     }
                     should_check_for_compaction = true;
                 }
                 Err(e) => {
-                    // tmp files already removed
                     return Err(e);
                 }
             }
@@ -2279,6 +2363,11 @@ impl KVEngine {
             self.compact()?;
         }
         Ok(())
+    }
+    fn fail(&mut self, msg: String) {
+        if self.db_failed.is_none() {
+            self.db_failed = Some(msg);
+        }
     }
 }
 

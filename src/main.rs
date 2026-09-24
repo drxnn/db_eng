@@ -4,6 +4,7 @@ mod errors;
 mod helpers;
 mod lsm;
 mod manifest;
+mod wal;
 
 fn main() {}
 
