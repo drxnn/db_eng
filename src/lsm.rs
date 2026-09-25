@@ -19,10 +19,10 @@ use crate::errors::CorruptionType::{Other, SstLevelMalformed};
 use crate::errors::{
     CorruptionType, CrcType, DataCorruptedErr, DbError, InvalidMemtableInput, Result,
 };
-use crate::helpers::{CRC32, get_hlc_from_valid_pathbuf};
+use crate::helpers::{CRC32, get_hlc_from_valid_pathbuf, read_u64};
 use crate::helpers::{
     NUM_HASHES, check_crc, create_new_data_file, find_max_hlc_between_files,
-    get_hashed_key_positions, new_timestamp, read_exact_or_corrupt, read_range,
+    get_hashed_key_positions, new_timestamp, read_exact_or_truncated, read_range,
 };
 use crate::lsm::Lookup::{Absent, Deleted, Found};
 use crate::lsm::SyncConfig::{Always, Every};
@@ -37,6 +37,8 @@ const DATA_BLOCK: u16 = 8 * 1024; // Data block in SSTable
 pub const DATA_BLOCK_MAX_BYTES_SIZE: u64 = 155673; // 8192(max db_size) + KEY_MAX_BYTES_SIZE + VALUE_MAX_BYTES_SIZE + 25 bytes for metadata(timestamp, ksz,vsz,tmbstone); // if we had a db_size of 8191, we could end up with adding a max val and max key
 // const MAX_BLOCK_SIZE: u64 = 1024 * 1024;
 pub const MAX_SST_SIZE: u64 = 1024 * 1024 * 100;
+
+pub const COMPACTION_READ_BUFFER_LEN: usize = 64 * 1024;
 const TAG_DELETION: u8 = 2;
 const TAG_INSERTION: u8 = 4;
 pub const SST_LEVEL_COUNT: usize = 4;
@@ -53,6 +55,40 @@ pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L3_COMPACTION: u64 = MAX_SST_SIZE * 100
 pub const NUM_OF_BYTES_NEEDED_TO_TRIGGER_L4_COMPACTION: u64 = MAX_SST_SIZE * 10000;
 pub const DEFAULT_DATA_DIR: &str = "data";
 pub const MAX_FLUSH_ATTEMPTS: u8 = 5;
+pub const U64_LEN: usize = size_of::<u64>(); // 8
+pub const TOMBSTONE_LEN: usize = 1;
+pub const RECORD_KSZ_OFFSET: usize = U64_LEN; // 8
+pub const RECORD_VSZ_OFFSET: usize = 2 * U64_LEN; // 16
+pub const RECORD_TOMBSTONE_OFFSET: usize = 3 * U64_LEN; // 24
+pub const RECORD_HEADER_LEN: usize = 3 * U64_LEN + TOMBSTONE_LEN; // 25
+
+pub const TOMBSTONE_DELETED: u8 = 0xFF;
+pub const TOMBSTONE_LIVE: u8 = 0x00;
+
+pub const BLOOM_BITS_PER_KEY: usize = 10;
+
+pub const CRC_LEN: usize = 4;
+pub const LEVEL_LEN: usize = 1;
+pub const TAG_LEN: usize = 1;
+
+pub const LEVELS: usize = 4;
+
+// below is to read footer from
+pub const FOOTER_SPARSE_OFFSET_START: usize = 0;
+pub const FOOTER_SPARSE_LEN_START: usize = FOOTER_SPARSE_OFFSET_START + U64_LEN; // 8
+pub const FOOTER_BLOOM_LEN_START: usize = FOOTER_SPARSE_LEN_START + U64_LEN; // 16
+pub const FOOTER_MIN_KEY_LEN_START: usize = FOOTER_BLOOM_LEN_START + U64_LEN; // 24
+pub const FOOTER_MAX_KEY_LEN_START: usize = FOOTER_MIN_KEY_LEN_START + U64_LEN; // 32
+pub const FOOTER_LEVEL_START: usize = FOOTER_MAX_KEY_LEN_START + U64_LEN; // 40
+pub const FOOTER_FIXED_LEN: usize = FOOTER_LEVEL_START + LEVEL_LEN; // 41
+
+pub const FOOTER_SPARSE_CRC_START: usize = FOOTER_FIXED_LEN; // 41
+pub const FOOTER_BLOOM_CRC_START: usize = FOOTER_SPARSE_CRC_START + CRC_LEN; // 45
+pub const FOOTER_MIN_MAX_CRC_START: usize = FOOTER_BLOOM_CRC_START + CRC_LEN; // 49
+pub const FOOTER_FIELDS_CRC_START: usize = FOOTER_MIN_MAX_CRC_START + CRC_LEN; // 53
+pub const FOOTER_LEN: usize = FOOTER_FIELDS_CRC_START + CRC_LEN;
+
+pub const BLOOM_WORD_BITS: usize = 64;
 
 // WAL config for flush
 
@@ -127,9 +163,7 @@ impl SparseIndex {
         // Have caller
         let mut current = 0;
         while current < b.len() {
-            // let ksz = u64::from_le_bytes(b[current..(current + 8)].try_into().unwrap());
-            // put in a function and reuse
-            let ksz = u64::from_le_bytes(read_range(b, current, current + 8)?.try_into().unwrap());
+            let ksz = read_u64(b, current)?;
             if ksz > KEY_MAX_BYTES_SIZE {
                 return Err(DbError::DataCorrupted(DataCorruptedErr {
                     offset: current as u64,
@@ -140,18 +174,16 @@ impl SparseIndex {
                     },
                 }));
             }
-            current += 8;
+            current += U64_LEN;
             let key = read_range(b, current, current + (ksz as usize))?.to_vec();
 
             current += ksz as usize;
 
-            let offset =
-                u64::from_le_bytes(read_range(b, current, current + 8)?.try_into().unwrap());
+            let offset = read_u64(b, current)?;
 
-            current += 8;
+            current += U64_LEN;
 
-            let data_block_size =
-                u64::from_le_bytes(read_range(b, current, current + 8)?.try_into().unwrap());
+            let data_block_size = read_u64(b, current)?;
             if data_block_size > DATA_BLOCK_MAX_BYTES_SIZE {
                 return Err(DbError::DataCorrupted(DataCorruptedErr {
                     offset: current as u64,
@@ -162,7 +194,7 @@ impl SparseIndex {
                     },
                 }));
             }
-            current += 8;
+            current += U64_LEN;
             out.push((key, offset, data_block_size));
         }
         Ok(out)
@@ -171,18 +203,18 @@ impl SparseIndex {
 
 impl BloomFilter {
     pub fn new(num_bits: usize) -> Self {
-        let words_for_bits = num_bits.div_ceil(64);
+        let words_for_bits = num_bits.div_ceil(BLOOM_WORD_BITS);
 
         Self {
             bits: vec![0u64; words_for_bits],
-            num_bits: (words_for_bits * 64) as u64,
+            num_bits: (words_for_bits * BLOOM_WORD_BITS) as u64,
         }
     }
 
     pub fn set_bits(&mut self, positons: [usize; NUM_HASHES]) {
         for position in positons {
-            let word_idx = position / 64;
-            let bit_idx = position % 64;
+            let word_idx = position / BLOOM_WORD_BITS;
+            let bit_idx = position % BLOOM_WORD_BITS;
 
             self.bits[word_idx] |= 1u64 << bit_idx; // shift the bit to the left by bit_idx positions and thats our mask. mask OR curr_u64 = done
         }
@@ -190,8 +222,8 @@ impl BloomFilter {
 
     pub fn check_bits(&self, positons: [usize; NUM_HASHES]) -> bool {
         for position in positons {
-            let word_idx = position / 64;
-            let bit_idx = position % 64;
+            let word_idx = position / BLOOM_WORD_BITS;
+            let bit_idx = position % BLOOM_WORD_BITS;
 
             if ((self.bits[word_idx] >> bit_idx) & 1u64) == 0 {
                 return false;
@@ -224,8 +256,9 @@ impl WAL {
         let wal_file = OpenOptions::new()
             .read(true)
             .append(true)
-            .create(true)
+            .create_new(true)
             .open(&wal_path)?;
+        File::open(parent_dir)?.sync_all()?;
         Ok(Self {
             id: curr_hlc,
             wal_writer: Some(BufWriter::new(wal_file)),
@@ -275,6 +308,9 @@ impl WAL {
                         writer.get_ref().sync_all()?;
                     }
                     Every(ms) => {
+                        // TODO: this here isnt really accurate because if we have no record_to_wal call, more time can elapse than the specified ms
+                        // we assume that theres always writes happening.
+
                         if self.last_sync.elapsed() >= Duration::from_millis(ms) {
                             writer.get_ref().sync_all()?;
                             self.last_sync = Instant::now()
@@ -325,17 +361,13 @@ impl SsTableDataBlock {
     }
 
     pub fn grab_min_key_from_data_block(&mut self) -> Result<Vec<u8>> {
-        let mut pos = 8; // skip timestamp
+        let ksz = read_u64(self.bytes.get_ref(), RECORD_KSZ_OFFSET)?;
 
-        let ksz = u64::from_le_bytes(
-            read_range(self.bytes.get_ref(), pos, pos + 8)?
-                .try_into()
-                .unwrap(),
-        );
-        pos += 8;
-        pos += 8;
-        pos += 1;
-        let key = read_range(self.bytes.get_ref(), pos, pos + ksz as usize)?;
+        let key = read_range(
+            self.bytes.get_ref(),
+            RECORD_HEADER_LEN,
+            RECORD_HEADER_LEN + ksz as usize,
+        )?;
 
         Ok(key.to_vec())
     }
@@ -346,24 +378,15 @@ impl SsTableDataBlock {
 
         while pos < self.size {
             // when it throws eof, we have reached the end
-            pos += 8; // skip tstamp
-            let k_size = u64::from_le_bytes(
-                read_range(self.bytes.get_ref(), pos, pos + 8)?
-                    .try_into()
-                    .unwrap(),
-            );
-            pos += 8;
-            let v_size = u64::from_le_bytes(
-                read_range(self.bytes.get_ref(), pos, pos + 8)?
-                    .try_into()
-                    .unwrap(),
-            );
-            pos += 8;
-            pos += 1;
 
-            let key = read_range(self.bytes.get_ref(), pos, pos + k_size as usize)?;
-            pos += k_size as usize;
-            pos += v_size as usize;
+            let k_size = read_u64(self.bytes.get_ref(), RECORD_KSZ_OFFSET + pos)? as usize;
+
+            let v_size = read_u64(self.bytes.get_ref(), pos + RECORD_VSZ_OFFSET)? as usize;
+
+            let key_start = pos + RECORD_HEADER_LEN;
+
+            let key = read_range(self.bytes.get_ref(), key_start, key_start + k_size as usize)?;
+            pos = key_start + k_size + v_size;
             curr_max = Some(key);
         }
 
@@ -401,8 +424,9 @@ impl SSTable {
         let mut f = File::open(path)?;
         let file_metadata = f.metadata()?;
 
-        if file_metadata.len() <= 57 {
+        if file_metadata.len() <= FOOTER_LEN as u64 {
             // file too small
+            // err
         }
         let stem = path
             .file_stem()
@@ -414,14 +438,14 @@ impl SSTable {
             .ok()
             .ok_or_else(|| DbError::InvalidSstableFileName(path.to_path_buf()))?; // Have the caller skip file if this happens
 
-        f.seek(SeekFrom::End(-57))?;
-        let mut footer = [0u8; 41];
+        f.seek(SeekFrom::End(-(FOOTER_LEN as i64)))?;
+        let mut footer = [0u8; FOOTER_FIXED_LEN];
         f.read_exact(&mut footer)?;
 
-        let mut sparse_index_crc = [0u8; 4];
-        let mut bloom_filter_crc = [0u8; 4];
-        let mut metadata_crc = [0u8; 4];
-        let mut min_max_crc = [0u8; 4];
+        let mut sparse_index_crc = [0u8; CRC_LEN];
+        let mut bloom_filter_crc = [0u8; CRC_LEN];
+        let mut metadata_crc = [0u8; CRC_LEN];
+        let mut min_max_crc = [0u8; CRC_LEN];
 
         f.read_exact(&mut sparse_index_crc)?;
         f.read_exact(&mut bloom_filter_crc)?;
@@ -442,25 +466,29 @@ impl SSTable {
             CrcType::SstFooterMetadata,
         )?;
 
-        let level = u8::from_le_bytes(read_range(&footer, 40, 41)?.try_into().unwrap());
+        let level = u8::from_le_bytes(
+            read_range(&footer, FOOTER_LEVEL_START, FOOTER_FIXED_LEN)?
+                .try_into()
+                .unwrap(),
+        );
 
         if level as usize >= SST_LEVEL_COUNT {
             return Err(DbError::DataCorrupted(DataCorruptedErr {
-                offset: file_metadata.len() - 17,
+                offset: file_metadata.len() - (FOOTER_LEN - FOOTER_LEVEL_START) as u64, // - 17
                 file_path: path.to_path_buf(),
                 reason: SstLevelMalformed(level as usize),
             }));
         }
         let file_length = f.metadata()?.len();
 
-        let sparse_index_offset =
-            u64::from_le_bytes(read_range(&footer, 0, 8)?.try_into().unwrap());
-        let size_of_sparse_index =
-            u64::from_le_bytes(read_range(&footer, 8, 16)?.try_into().unwrap());
-        let size_of_bloom_filter =
-            u64::from_le_bytes(read_range(&footer, 16, 24)?.try_into().unwrap()); // byte count of vector
-        let size_of_min_key = u64::from_le_bytes(read_range(&footer, 24, 32)?.try_into().unwrap());
-        let size_of_max_key = u64::from_le_bytes(read_range(&footer, 32, 40)?.try_into().unwrap());
+        let sparse_index_offset = read_u64(&footer, FOOTER_SPARSE_OFFSET_START)?;
+
+        let size_of_sparse_index = read_u64(&footer, FOOTER_SPARSE_LEN_START)?;
+
+        let size_of_bloom_filter = read_u64(&footer, FOOTER_BLOOM_LEN_START)?; // byte count of vector
+        let size_of_min_key = read_u64(&footer, FOOTER_MIN_KEY_LEN_START)?;
+
+        let size_of_max_key = read_u64(&footer, FOOTER_MAX_KEY_LEN_START)?;
 
         let full_data_length = size_of_sparse_index
             .checked_add(size_of_bloom_filter)
@@ -542,7 +570,7 @@ impl SSTable {
         )?);
 
         let bloomf_filter_64: Vec<u64> = bloom_filter
-            .chunks_exact(8)
+            .chunks_exact(U64_LEN)
             .map(|chunk| {
                 u64::from_le_bytes(
                     chunk
@@ -552,7 +580,7 @@ impl SSTable {
             })
             .collect();
 
-        let num_bits = (bloomf_filter_64.len() * 64) as u64;
+        let num_bits = (bloomf_filter_64.len() * BLOOM_WORD_BITS) as u64;
 
         // IF THE BLOOM_FILTER BITS ARE CORRUPTED, WE JUST DON'T USE IT. NO ERR
         let bloom_filter = if bloom_filter_crc_check == bloom_filter_crc_in_file {
@@ -635,12 +663,13 @@ impl SSTable {
         };
 
         let f = &mut self.file;
+        let block_len = *last_data_block_length as usize;
 
-        let mut data_block_buffer_and_crc = vec![0u8; (*last_data_block_length + 4) as usize]; // 4 for the crc
+        let mut data_block_buffer_and_crc = vec![0u8; block_len + CRC_LEN];
         f.read_exact_at(&mut data_block_buffer_and_crc, *last_sparse_offset)?;
-        let data_block_buffer = &data_block_buffer_and_crc[..(*last_data_block_length as usize)];
+        let data_block_buffer = &data_block_buffer_and_crc[..block_len];
 
-        let crc = &data_block_buffer_and_crc[(*last_data_block_length as usize)..];
+        let crc = &data_block_buffer_and_crc[block_len..];
 
         check_crc(
             CRC32.compute_crc_data_block(data_block_buffer),
@@ -653,31 +682,23 @@ impl SSTable {
         let mut max_k: Option<&[u8]> = None;
         let mut pos = 0;
 
-        while pos < *last_data_block_length {
-            pos += 8; // skip tstamp
-            let ksz = u64::from_le_bytes(
-                read_range(data_block_buffer, pos as usize, (pos + 8) as usize)?
-                    .try_into()
-                    .unwrap(),
-            );
-            pos += 8;
-            let vsz = u64::from_le_bytes(
-                read_range(data_block_buffer, pos as usize, (pos + 8) as usize)?
-                    .try_into()
-                    .unwrap(),
-            );
-            pos += 8;
-            pos += 1; // skip tombstone
+        while pos < block_len {
+            //[ tstamp(8) | ksz(8) | value_sz(8) | tombstone | key | value |  ] ... crc(4) (crc for the entire datablock);
+
+            let ksz = read_u64(data_block_buffer, pos + RECORD_KSZ_OFFSET)? as usize;
+
+            let vsz = read_u64(data_block_buffer, pos + RECORD_VSZ_OFFSET)? as usize;
+
             max_k = Some(read_range(
                 data_block_buffer,
-                pos as usize,
-                (pos + ksz) as usize,
+                pos + RECORD_HEADER_LEN,
+                (pos + RECORD_HEADER_LEN + ksz) as usize,
             )?);
 
-            pos += ksz + vsz; // skip val
+            pos += ksz + vsz + RECORD_HEADER_LEN; // skip val
         }
 
-        if pos != data_block_buffer.len() as u64 {
+        if pos != data_block_buffer.len() {
             return Err(DbError::MalformedDataBlock(
                 "last record runs past end of block".to_string(),
             ));
@@ -721,7 +742,11 @@ impl Node {
         let tstamp = self.entry.timestamp.to_le_bytes();
         let ksz = (self.entry.key.len() as u64).to_le_bytes();
         let vsz = (self.entry.value.len() as u64).to_le_bytes();
-        let tombstone_in_byte: [u8; 1] = [if self.entry.deleted { 0xFF } else { 0x00 }];
+        let tombstone_in_byte: [u8; TOMBSTONE_LEN] = [if self.entry.deleted {
+            TOMBSTONE_DELETED
+        } else {
+            TOMBSTONE_LIVE
+        }];
 
         [
             &tstamp,
@@ -800,7 +825,8 @@ impl AVL {
             node = Self::balance(node);
             Some(node)
         } else {
-            self.size_in_bytes += n.entry.value.len() as u64 + n.entry.key.len() as u64 + 25; // 25 account for record metadata// TODO: find all usge of numbers and make it a const
+            self.size_in_bytes +=
+                n.entry.value.len() as u64 + n.entry.key.len() as u64 + RECORD_HEADER_LEN as u64; // 25 account for record metadata// TODO: find all usge of numbers and make it a const
             self.size += 1;
             Some(Box::new(n))
         }
@@ -1066,7 +1092,7 @@ impl AVL {
 
             // sizeof(key) | key | offset | datablock block length ( before CRC )
             let mut sparse_index = SparseIndex::new();
-            let mut bloom_filter = BloomFilter::new(self.size as usize * 10);
+            let mut bloom_filter = BloomFilter::new(self.size as usize * BLOOM_BITS_PER_KEY);
 
             let mut file_offset: u64 = 0;
             self.build_sstable_recursive(
@@ -1093,14 +1119,16 @@ impl AVL {
                 min_k,
                 max_k,
                 sparse_index.index_entries.len() as u64,
-                (bloom_filter.bits.len() * 8) as u64, // multiply by 8, needed for reading the u8s during load
-                0_u8,
+                (bloom_filter.bits.len() * U64_LEN) as u64, // multiply by 8, needed for reading the u8s during load
+                0_u8,                                       // LEVEL 0
             );
 
             let footer_len = footer.len();
 
-            let footer_crc = CRC32.compute_crc_data_block(&footer[footer_len - 41..footer_len]);
-            let min_max_crc = CRC32.compute_crc_data_block(&footer[..footer_len - 41]);
+            let footer_crc =
+                CRC32.compute_crc_data_block(&footer[footer_len - FOOTER_FIXED_LEN..footer_len]);
+            let min_max_crc =
+                CRC32.compute_crc_data_block(&footer[..footer_len - FOOTER_FIXED_LEN]);
             let sparse_crc = CRC32.compute_crc_data_block(&sparse_index.index_entries);
 
             writer.write_all(&sparse_index.index_entries)?;
@@ -1150,9 +1178,9 @@ struct FlushingManager {
 }
 
 pub enum WalReplayState {
-    Clean,                   // replayed everything to mem
-    PartialTruncated,        // JUST DELETE FILE HERE
-    PartialCorrupt(DbError), // offset, err // HERE YOU TELL THE CALLER THAT FILE IS CORRUPT
+    Clean, // replayed everything to mem
+    PartialTruncated, // JUST DELETE FILE HERE
+           // u64 is the position of the last valid wal record(the last valid record before we threw error), err // HERE YOU TELL THE CALLER THAT FILE IS CORRUPT
 }
 pub struct WalToMemtableReplay {
     memtable: AVL,
@@ -1173,7 +1201,6 @@ impl FlushingManager {
         &mut self,
         frozen_instance: FrozenMemtableInstance,
         dir: PathBuf,
-        hlc: u64,
     ) -> Result<()> {
         let tx: Sender<FlushingThreadResponse> = self.tx.clone();
         let id = frozen_instance.id;
@@ -1213,27 +1240,28 @@ impl FlushingManager {
 
         let mut reader = BufReader::new(&wal_f);
 
-        let mut type_of_record: [u8; 1] = [0u8; 1];
-        let mut valid_bytes: u64 = 0;
-        let mut ksz = [0u8; 8];
-        let mut tstamp = [0u8; 8];
-        let mut vsz = [0u8; 8];
-        let mut crc = [0u8; 4];
+        let mut type_of_record: [u8; TAG_LEN] = [0u8; TAG_LEN];
+
+        let mut ksz = [0u8; U64_LEN];
+        let mut tstamp = [0u8; U64_LEN];
+        let mut vsz = [0u8; U64_LEN];
+        let mut crc = [0u8; CRC_LEN];
         let mut pos: u64 = 0;
+
         let outcome = (|| -> Result<()> {
             while pos < file_len {
                 // We should read records up until a truncated record or a corrupted record, then we stop
-                read_exact_or_corrupt(&mut reader, &mut type_of_record, curr_offset, path)?;
-                curr_offset += 1;
+                read_exact_or_truncated(&mut reader, &mut type_of_record, curr_offset, path)?;
+                curr_offset += TAG_LEN as u64;
                 let type_tag = type_of_record[0];
 
                 match type_tag {
                     TAG_DELETION => {
                         //  TAG_DELETION handle  [ tstamp(8) | ksz(8) | key(sizeof ksz ) |crc (4 bytes) ]
-                        read_exact_or_corrupt(&mut reader, &mut tstamp, curr_offset, path)?;
-                        curr_offset += 8;
-                        read_exact_or_corrupt(&mut reader, &mut ksz, curr_offset, path)?;
-                        curr_offset += 8;
+                        read_exact_or_truncated(&mut reader, &mut tstamp, curr_offset, path)?;
+                        curr_offset += U64_LEN as u64;
+                        read_exact_or_truncated(&mut reader, &mut ksz, curr_offset, path)?;
+                        curr_offset += U64_LEN as u64;
 
                         let key_size = u64::from_le_bytes(ksz);
 
@@ -1248,15 +1276,15 @@ impl FlushingManager {
                         }
                         let mut key_buffer = vec![0u8; key_size as usize];
 
-                        read_exact_or_corrupt(&mut reader, &mut key_buffer, curr_offset, path)?;
+                        read_exact_or_truncated(&mut reader, &mut key_buffer, curr_offset, path)?;
                         curr_offset += key_size;
 
                         let crc_data_block =
                             [type_of_record.as_slice(), &tstamp, &ksz, &key_buffer].concat();
                         let crc_to_check = CRC32.compute_crc_data_block(&crc_data_block);
 
-                        read_exact_or_corrupt(&mut reader, &mut crc, curr_offset, path)?;
-                        curr_offset += 4;
+                        read_exact_or_truncated(&mut reader, &mut crc, curr_offset, path)?;
+                        curr_offset += CRC_LEN as u64;
 
                         let crc_from_buff = u32::from_le_bytes(crc);
 
@@ -1264,18 +1292,17 @@ impl FlushingManager {
                         let ts = u64::from_le_bytes(tstamp);
                         most_recent_hlc = Some(most_recent_hlc.unwrap_or(0).max(ts));
 
-                        valid_bytes += key_size + 21; // 4 for crc
                         pos = reader.stream_position()?;
                         memtable.delete(&key_buffer, ts);
                         records_recovered += 1;
                     }
                     TAG_INSERTION => {
-                        read_exact_or_corrupt(&mut reader, &mut tstamp, curr_offset, path)?;
-                        curr_offset += 8;
-                        read_exact_or_corrupt(&mut reader, &mut ksz, curr_offset, path)?;
-                        curr_offset += 8;
-                        read_exact_or_corrupt(&mut reader, &mut vsz, curr_offset, path)?;
-                        curr_offset += 8;
+                        read_exact_or_truncated(&mut reader, &mut tstamp, curr_offset, path)?;
+                        curr_offset += U64_LEN as u64;
+                        read_exact_or_truncated(&mut reader, &mut ksz, curr_offset, path)?;
+                        curr_offset += U64_LEN as u64;
+                        read_exact_or_truncated(&mut reader, &mut vsz, curr_offset, path)?;
+                        curr_offset += U64_LEN as u64;
 
                         let key_size = u64::from_le_bytes(ksz);
                         let val_size = u64::from_le_bytes(vsz);
@@ -1292,10 +1319,10 @@ impl FlushingManager {
                         let mut key_buffer = vec![0u8; key_size as usize];
                         let mut val_buffer = vec![0u8; val_size as usize];
 
-                        read_exact_or_corrupt(&mut reader, &mut key_buffer, curr_offset, path)?;
+                        read_exact_or_truncated(&mut reader, &mut key_buffer, curr_offset, path)?;
                         curr_offset += key_size;
 
-                        read_exact_or_corrupt(&mut reader, &mut val_buffer, curr_offset, path)?;
+                        read_exact_or_truncated(&mut reader, &mut val_buffer, curr_offset, path)?;
                         curr_offset += val_size;
 
                         let crc_data_block = [
@@ -1309,8 +1336,8 @@ impl FlushingManager {
                         .concat();
                         let crc_to_check = CRC32.compute_crc_data_block(&crc_data_block);
 
-                        read_exact_or_corrupt(&mut reader, &mut crc, curr_offset, path)?;
-                        curr_offset += 4;
+                        read_exact_or_truncated(&mut reader, &mut crc, curr_offset, path)?;
+                        curr_offset += CRC_LEN as u64;
 
                         let crc_from_buff = u32::from_le_bytes(crc);
 
@@ -1319,7 +1346,6 @@ impl FlushingManager {
                         let ts = u64::from_le_bytes(tstamp);
                         most_recent_hlc = Some(most_recent_hlc.unwrap_or(0).max(ts));
 
-                        valid_bytes += key_size + val_size + 29;
                         pos = reader.stream_position()?;
 
                         memtable.put(&key_buffer, &val_buffer, ts);
@@ -1331,7 +1357,7 @@ impl FlushingManager {
                         // corrupt
                         return Err(DbError::DataCorrupted(DataCorruptedErr {
                             reason: CorruptionType::RecordTypeCorrupted { found: type_tag },
-                            offset: curr_offset - 1,
+                            offset: curr_offset - TAG_LEN as u64,
                             file_path: path.to_path_buf(),
                         }));
                     }
@@ -1342,49 +1368,26 @@ impl FlushingManager {
 
         let replay_state = match outcome {
             Ok(()) => WalReplayState::Clean,
-            Err(DbError::DataCorrupted(DataCorruptedErr {
-                reason: CorruptionType::TruncatedRecord,
-                offset,
-                ..
-            })) => WalReplayState::PartialTruncated,
-            Err(e) => WalReplayState::PartialCorrupt(e),
+            Err(DbError::DataCorrupted(e)) => WalReplayState::PartialTruncated, // we keep all the valid records from wal that we can salvage
+            Err(e) => return Err(e),
         };
-        match replay_state {
-            // repetitive but eventually PartialCorrupt might do extra stuff
-            replay_state @ WalReplayState::Clean => Ok(WalToMemtableReplay {
-                memtable,
-                records_recovered,
-                valid_bytes,
-                replay_state,
-                most_recent_hlc,
-            }),
-            replay_state @ WalReplayState::PartialTruncated => Ok(WalToMemtableReplay {
-                memtable,
-                records_recovered,
-                valid_bytes,
-                replay_state,
-                most_recent_hlc,
-            }),
-            replay_state @ WalReplayState::PartialCorrupt(_) => Ok(WalToMemtableReplay {
-                memtable,
-                records_recovered,
-                valid_bytes,
-                replay_state,
-                most_recent_hlc,
-            }),
-        }
+
+        Ok(WalToMemtableReplay {
+            memtable,
+            records_recovered,
+            valid_bytes: pos, // pos is only updated when we read a valid record
+            most_recent_hlc,
+            replay_state,
+        })
     }
 
     fn retrieve_wal_records(
-        &mut self,
+        &self,
         path: &PathBuf,
         dir: &PathBuf,
         hlc: &Hlc,
     ) -> Result<Option<SSTable>> {
         let replay = self.build_avl_from_wal(path)?;
-        if let WalReplayState::PartialCorrupt(e) = replay.replay_state {
-            return Err(e);
-        }
 
         let Some(max_hlc) = replay.most_recent_hlc else {
             let _ = fs::remove_file(path); // no hlc no records
@@ -1392,12 +1395,6 @@ impl FlushingManager {
         };
         hlc.recover_to(max_hlc);
 
-        // if dir.join(format!("{max_hlc}.sst")).exists() {
-        //     // in case the wal was already retrived but engine crashed before removing the file
-        //     // this shouild not be needed anymore ( we use min_live_wal)
-        //     let _ = fs::remove_file(path);
-        //     return Ok(None);
-        // }
         let (f, ss_final_path) = match replay.memtable.sync_avl(dir, max_hlc) {
             Ok(Some((f, ss_final_path))) => {
                 if let Some(dir) = ss_final_path.parent() {
@@ -1446,7 +1443,6 @@ struct KVEngine {
     wal: WAL,
     memtable: AVL,
     frozen_memtables: BTreeMap<u64, FrozenMemtableInstance>, // ordered. id(hlc) -> mem
-    // frozen_memtable: Option<Arc<AVL>>,                               // and here
     corrupted_files: HashSet<PathBuf>,
     flushing_manager: FlushingManager,
     hlc: Arc<Hlc>, // first 52 bits are the time stamp, 12 last bits are the counter
@@ -1520,7 +1516,6 @@ impl Hlc {
 }
 
 impl KVEngine {
-    // threshold and sync_config can be part of one config struct later.
     fn open(dir_name: &Path, sync_config: SyncConfig) -> Result<KVEngine> {
         let path = PathBuf::from(dir_name);
 
@@ -1567,8 +1562,17 @@ impl KVEngine {
                 ));
             }
             None => Manifest::new_manifest(dir_name)?,
-            // what if we dont have a manifest but we have sst files? we should reject
         };
+
+        for level in &manifest.state.levels {
+            level.iter().try_for_each(|file_id|-> Result<()>{
+                if !sst_vec.iter().any(|(id, _)|  id == file_id) {
+                    // error, file in manifest but not in the director
+                    return Err(DbError::ManifestError(format!("The manifest contains a file that is not present in the data directory. File id missing: {file_id}")));
+                }
+                Ok(())
+            })?;
+        }
 
         let max_hlc = sst_vec
             .iter()
@@ -1584,7 +1588,7 @@ impl KVEngine {
                         return true;
                     }
                 }
-                return false;
+                false
             });
 
         let hlc = Hlc::new();
@@ -1731,7 +1735,7 @@ impl KVEngine {
         }
         let mut data_buffer = vec![0u8; data_len as usize];
 
-        let mut crc = [0u8; 4];
+        let mut crc = [0u8; CRC_LEN];
 
         let mut reader = BufReader::new(&sstable.file);
 
@@ -1756,7 +1760,7 @@ impl KVEngine {
 
         let mut pos = 0;
         while pos < data_buffer.len() {
-            if pos + 25 > data_buffer.len() {
+            if pos + RECORD_HEADER_LEN > data_buffer.len() {
                 return Err(DbError::DataCorrupted(DataCorruptedErr {
                     offset: offset + pos as u64,
                     file_path: sstable.file_path.clone(),
@@ -1769,23 +1773,18 @@ impl KVEngine {
             }
 
             // its actually: [ tstamp(8) | ksz(8) | value_sz(8) |tombstone| key | value |  ]
-            let ksz = u64::from_le_bytes(
-                read_range(&data_buffer, pos + 8, pos + 16)?
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            // u64::from_le_bytes(data_buffer[pos + 8..pos + 16].try_into().unwrap()) as usize;
-            let vsz = u64::from_le_bytes(
-                read_range(&data_buffer, pos + 16, pos + 24)?
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            // u64::from_le_bytes(data_buffer[pos + 16..pos + 24].try_into().unwrap()) as usize;
-            // let deleted = &data_buffer[pos + 24..pos + 25][0];
-            let deleted = read_range(&data_buffer, pos + 24, pos + 25)?[0];
+            let ksz = read_u64(&data_buffer, pos + RECORD_KSZ_OFFSET)? as usize;
+
+            let vsz = read_u64(&data_buffer, pos + RECORD_VSZ_OFFSET)? as usize;
+
+            let deleted = read_range(
+                &data_buffer,
+                pos + RECORD_TOMBSTONE_OFFSET,
+                pos + RECORD_HEADER_LEN,
+            )?[0];
             // [ tstamp(8) | ksz(8) | value_sz(8) | deletedflag(1) | key | value ]
             // check ksz and vsz doesnt overflow
-            let key_start = pos + 25;
+            let key_start = pos + RECORD_HEADER_LEN;
 
             let val_end = key_start
                 .checked_add(ksz)
@@ -1823,7 +1822,7 @@ impl KVEngine {
                     continue;
                 }
                 CmpOrdering::Equal => {
-                    if deleted == 0xFF {
+                    if deleted == TOMBSTONE_DELETED {
                         return Ok(Deleted);
                     }
                     return Ok(Found(value.to_vec()));
@@ -1854,7 +1853,7 @@ impl KVEngine {
         Ok(None)
     }
 
-    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.memtable.get(key) {
             Found(bytes) => return Ok(Some(bytes.to_vec())),
             Deleted => return Ok(None),
@@ -1998,7 +1997,6 @@ impl KVEngine {
                 flush_attempts: 0,
             },
             self.data_directory.clone(),
-            tick,
         )?;
 
         Ok(())
@@ -2039,7 +2037,7 @@ impl KVEngine {
 
     fn select_files_for_l0_compaction(
         &self,
-        levels: &RwLockReadGuard<'_, [Vec<SSTable>; 4]>,
+        levels: &RwLockReadGuard<'_, [Vec<SSTable>; LEVELS]>,
     ) -> Result<Option<Vec<CompactionSstSlice>>> {
         let mut vec_of_overlapping_pathbufs: Vec<&SSTable> = Vec::new();
         let ssts_in_level = &levels[0];
@@ -2074,7 +2072,7 @@ impl KVEngine {
 
     fn select_level_for_compaction(
         &self,
-        levels: &RwLockReadGuard<'_, [Vec<SSTable>; 4]>,
+        levels: &RwLockReadGuard<'_, [Vec<SSTable>; LEVELS]>,
     ) -> Option<(f64, u8)> {
         let mut best_ratio_candidate: Option<(f64, u8)> = None; // first number is ratio, second is what level
 
@@ -2121,7 +2119,7 @@ impl KVEngine {
 
     fn select_files_for_compaction(
         &self,
-        levels: &RwLockReadGuard<'_, [Vec<SSTable>; 4]>,
+        levels: &RwLockReadGuard<'_, [Vec<SSTable>; LEVELS]>,
         level: u8,
     ) -> Result<Option<Vec<CompactionSstSlice>>> {
         let mut best_candidate: Option<(u64, &SSTable)> = None; // will be made into a struct later
@@ -2217,6 +2215,9 @@ impl KVEngine {
                 Arc::clone(&self.hlc),
             );
 
+            // if this returns an error, because one or more of the files are corrupt, trying again will just error again
+            // mark them
+
             self.compaction_manager.start(compaction_job)?; // if this throws an error, theres another compaction running so just throw away, compact will be called again
         } // 
 
@@ -2265,7 +2266,6 @@ impl KVEngine {
                                     flush_attempts: instance.flush_attempts,
                                 },
                                 self.data_directory.clone(),
-                                instance.id,
                             )?;
                         } else {
                             self.fail(format!("memtable {id} failed to flush after {MAX_FLUSH_ATTEMPTS} attempts. \
@@ -2280,6 +2280,7 @@ impl KVEngine {
 
         while let Some(first) = self.frozen_memtables.first_entry() {
             let Some(sst_id) = first.get().sstable.as_ref().map(|sst| sst.id) else {
+                // sstable there = finished
                 break;
             };
 
@@ -2304,9 +2305,7 @@ impl KVEngine {
             let _ = fs::remove_file(self.data_directory.join(format!("{}.wal", wal_id)));
         }
 
-        // then check compaction
         if let Some(result) = self.compaction_manager.poll() {
-            //
             match result {
                 Ok(compaction_outcome) => {
                     let edit = ManifestEdit {
@@ -2352,6 +2351,15 @@ impl KVEngine {
                         let _ = remove_file(self.data_directory.join(format!("{sst_id}.sst")));
                     }
                     should_check_for_compaction = true;
+                }
+                Err(DbError::DataCorrupted(e)) => {
+                    // propagated to here by a compaction failure on a corrupt file. There could be more files that are actually corrupt
+                    // but this is what set it off.
+                    self.corrupted_files.insert(e.file_path.clone());
+                    self.fail(format!(
+        "compaction stopped on a corrupt input file; writes disabled, reads still served: {e}"
+    ));
+                    return Err(DbError::DataCorrupted(e));
                 }
                 Err(e) => {
                     return Err(e);

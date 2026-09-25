@@ -3,7 +3,7 @@ use crate::{
         CorruptionType::{self, TruncatedRecord},
         CrcType, Result,
     },
-    lsm::Hlc,
+    lsm::{Hlc, U64_LEN},
 };
 use crc::{CRC_32_ISO_HDLC, Crc, Digest};
 use xxhash_rust::xxh3::xxh3_128;
@@ -95,7 +95,7 @@ pub fn get_positions_from_hashed_key(
     arr
 }
 
-pub fn read_exact_or_corrupt(
+pub fn read_exact_or_truncated(
     reader: &mut impl Read,
     buf: &mut [u8],
     offset: u64,
@@ -185,4 +185,12 @@ pub fn create_new_data_file(dir: &Path, hlc: u64) -> io::Result<(File, PathBuf)>
         .create_new(true)
         .open(&data_file_path)?;
     Ok((data_file, data_file_path))
+}
+
+pub fn read_u64(buffer: &[u8], start_offset: usize) -> Result<u64> {
+    Ok(u64::from_le_bytes(
+        read_range(buffer, start_offset, start_offset + U64_LEN)?
+            .try_into()
+            .unwrap(),
+    ))
 }

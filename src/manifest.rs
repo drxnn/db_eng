@@ -6,7 +6,8 @@ use std::{collections::BTreeSet, path::PathBuf};
 use std::{format, unimplemented};
 
 use crate::errors::{CorruptionType, CrcType, DataCorruptedErr, DbError};
-use crate::helpers::{CRC32, check_crc, read_range};
+use crate::helpers::{CRC32, check_crc, read_range, read_u64};
+use crate::lsm::{LEVEL_LEN, TAG_LEN, U64_LEN};
 use crate::{errors::Result, lsm::SST_LEVEL_COUNT};
 pub const MAX_MANIFEST_SIZE: u64 = 4 * 1024 * 1024;
 pub const TAG_ADD_FILE: u8 = 1;
@@ -70,7 +71,7 @@ impl ManifestState {
                 break; // 
             }
 
-            let length = u64::from_le_bytes(byte_to_deserialize[..8].try_into().unwrap()) as usize;
+            let length = read_u64(byte_to_deserialize, 0)? as usize;
             if length > MAX_MANIFEST_SIZE as usize {
                 return Err(DbError::ManifestError(format!(
                     "record length {length} is larger than the MAX_MANIFEST_SIZE"
@@ -155,10 +156,10 @@ impl ManifestState {
 pub struct Manifest {
     pub path: PathBuf,
     pub state: ManifestState,
-    pub dir: PathBuf,
-    pub file: File,
-    pub size: u64,
-    pub read_only: bool, // if we have a failure like disk full or hardware
+    dir: PathBuf,
+    file: File,
+    size: u64,
+    read_only: bool, // if we have a failure like disk full or hardware
 }
 
 impl Manifest {
@@ -215,7 +216,7 @@ impl Manifest {
         let full_record = Manifest::serialize_record(&validated);
         f.write_all(&full_record)?;
         f.sync_all()?;
-        fs::rename(&tmp, dir.join("MANIFEST"))?;
+        fs::rename(&tmp, dir.join(MANIFEST_FILE_NAME))?;
         File::open(dir)?.sync_all()?;
 
         Ok((full_record.len() as u64, f))
@@ -250,6 +251,12 @@ impl Manifest {
             return Err(DbError::ManifestError(
                 "manifest is read-only after a failed write".into(),
             ));
+        }
+
+        if self.size >= MAX_MANIFEST_SIZE {
+            let (size, file) = Manifest::write_snapshot(&self.dir, &self.state)?;
+            self.file = file;
+            self.size = size
         }
         let validated = self.state.check_edit_is_compatible_with_state(edit)?;
 
@@ -297,7 +304,8 @@ impl Manifest {
     pub fn deserialize_record(bytes: &[u8], path: &Path) -> Result<(ManifestEdit, usize)> {
         // so we read a record: length | payload | crc and return an edit so we can build state
 
-        let length = u64::from_le_bytes(read_range(bytes, 0, 8)?.try_into().unwrap());
+        let length = read_u64(bytes, 0)?;
+
         if length > MAX_MANIFEST_SIZE {
             return Err(DbError::ManifestError(format!(
                 "Record found in Manifest exceeds max manifest size. Length found: {length}"
@@ -319,38 +327,33 @@ impl Manifest {
             .unwrap(),
         );
 
-        check_crc(crc_to_check, crc_in_file, 8, &path, CrcType::ManifestRecord)?;
+        check_crc(crc_to_check, crc_in_file, 8, path, CrcType::ManifestRecord)?;
         let mut pos: usize = 0;
 
         while pos < payload.len() {
             let tag = u8::from_le_bytes(read_range(payload, pos, (pos + 1))?.try_into().unwrap());
-            pos += 1;
+            pos += TAG_LEN;
             match tag {
                 TAG_ADD_FILE => {
                     let lvl =
                         u8::from_le_bytes(read_range(payload, pos, (pos + 1))?.try_into().unwrap());
-                    pos += 1;
-                    let sst_id = u64::from_le_bytes(
-                        read_range(payload, pos, (pos + 8))?.try_into().unwrap(),
-                    );
-                    pos += 8;
+                    pos += LEVEL_LEN;
+                    let sst_id = read_u64(payload, pos)?;
+
+                    pos += U64_LEN;
                     new_files.push((lvl, sst_id));
                 }
                 TAG_DELETE_FILE => {
                     let lvl =
                         u8::from_le_bytes(read_range(payload, pos, (pos + 1))?.try_into().unwrap());
-                    pos += 1;
-                    let sst_id = u64::from_le_bytes(
-                        read_range(payload, pos, (pos + 8))?.try_into().unwrap(),
-                    );
-                    pos += 8;
+                    pos += LEVEL_LEN;
+                    let sst_id = read_u64(payload, pos)?;
+                    pos += U64_LEN;
                     deleted_files.push((lvl, sst_id));
                 }
                 TAG_MIN_LIVE_WAL => {
-                    let w_id = u64::from_le_bytes(
-                        read_range(payload, pos, (pos + 8))?.try_into().unwrap(),
-                    );
-                    pos += 8;
+                    let w_id = read_u64(payload, pos)?;
+                    pos += U64_LEN;
                     wal_id = Some(w_id);
                 }
                 found => {

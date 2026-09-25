@@ -21,10 +21,12 @@ use crate::errors::CompactionErr::{self};
 use crate::errors::CrcType;
 use crate::helpers::{
     CRC32, check_crc, check_key_value_record_does_not_exceed_max, create_new_data_file,
-    get_positions_from_hashed_key, hash_key, read_exact_or_corrupt,
+    get_positions_from_hashed_key, hash_key, read_exact_or_truncated,
 };
 use crate::lsm::{
-    AVL, BloomFilter, DATA_BLOCK_MAX_BYTES_SIZE, Hlc, MAX_SST_SIZE, SparseIndex, SsTableDataBlock,
+    AVL, BloomFilter, COMPACTION_READ_BUFFER_LEN, CRC_LEN, DATA_BLOCK_MAX_BYTES_SIZE,
+    FOOTER_FIXED_LEN, Hlc, MAX_SST_SIZE, SparseIndex, SsTableDataBlock, TOMBSTONE_DELETED,
+    TOMBSTONE_LEN, TOMBSTONE_LIVE, U64_LEN,
 };
 use crate::{
     errors::{DataCorruptedErr, DbError, Result},
@@ -55,16 +57,6 @@ struct SstFinalizer {
 
 impl SstFinalizer {
     fn new(dir: &Path, starting_key: Vec<u8>, hlc: &Hlc, lvl: u8) -> Result<Self> {
-        // PROBLEM: Our OUTPUT Sst file has the newest hlc regardless of the data thats in there,
-        // could be old data thats being compacted and now its the newest data
-        // Do: just use the highest HLC of the files being compacted into this one
-        // The Hlc of the SST is calculated at the time of flushing which means the Hlc is > than the biggest Hlc of the max key in the sst
-        // Bigger Hlc == more recent
-        // we are also going up a level so we need to make sure the key range in the newly compacted sst is correctly ordered with the other sst files in that level
-        // ALSO TODO: Add another metadata byte in the ssts, Level:
-        // File picker for compaction: pick one file in L_n, then find all the overlapping ssts in L_(n+1) and compact all of these together.
-        // output gets placed in L(n+1)
-        // in L0, compact every L0 wit every L1 sst
         //
         let id: u64 = hlc.tick();
         let (file, final_file) = create_new_data_file(dir, id)?;
@@ -154,9 +146,9 @@ impl MergeItem {
         let ksz = (self.entry.key.len() as u64).to_le_bytes();
         let vsz = self.entry.vsz.to_le_bytes();
         let deleted = if self.entry.deleted {
-            0xFF_u8.to_le_bytes()
+            TOMBSTONE_DELETED.to_le_bytes()
         } else {
-            0x00_u8.to_le_bytes()
+            TOMBSTONE_LIVE.to_le_bytes()
         };
         let key = &self.entry.key;
         let value = &self.entry.value;
@@ -185,7 +177,7 @@ struct HeapEntry {
 impl CompactionFileElement {
     fn new(sst_slice: CompactionSstSlice) -> Result<Self> {
         let file = File::open(&sst_slice.file_path)?;
-        let reader = BufReader::with_capacity(65536, file);
+        let reader = BufReader::with_capacity(COMPACTION_READ_BUFFER_LEN, file);
         Ok(Self {
             sst_slice,
             reader,
@@ -199,10 +191,10 @@ impl CompactionFileElement {
     }
 
     fn advance_data_block_header(&mut self) -> Result<Option<HeapEntry>> {
-        let mut tstamp = [0u8; 8];
-        let mut ksz = [0u8; 8];
-        let mut vsz = [0u8; 8];
-        let mut tmbstone = [0u8; 1];
+        let mut tstamp = [0u8; U64_LEN];
+        let mut ksz = [0u8; U64_LEN];
+        let mut vsz = [0u8; U64_LEN];
+        let mut tmbstone = [0u8; TOMBSTONE_LEN];
 
         if let Some(curr_data_block) = self.current_data_block.as_mut() {
             if curr_data_block.bytes.position() == curr_data_block.bytes.get_ref().len() as u64 {
@@ -210,16 +202,16 @@ impl CompactionFileElement {
             }
             let file_path = &self.sst_slice.file_path;
 
-            // if any read_exact_or_corrupt calls return UnexpectedEof, then we have a truncated error and we should throw data block and remainder of file away
-            read_exact_or_corrupt(
+            // if any read_exact_or_truncated calls return UnexpectedEof, then we have a truncated error and we should throw data block and remainder of file away
+            read_exact_or_truncated(
                 &mut curr_data_block.bytes,
                 &mut tstamp,
                 self.curr_offset_from_file,
                 file_path,
             )?;
 
-            self.curr_offset_from_file += 8;
-            read_exact_or_corrupt(
+            self.curr_offset_from_file += U64_LEN as u64;
+            read_exact_or_truncated(
                 &mut curr_data_block.bytes,
                 &mut ksz,
                 self.curr_offset_from_file,
@@ -233,9 +225,9 @@ impl CompactionFileElement {
                 self.curr_offset_from_file,
                 file_path,
             )?;
-            self.curr_offset_from_file += 8;
+            self.curr_offset_from_file += U64_LEN as u64;
 
-            read_exact_or_corrupt(
+            read_exact_or_truncated(
                 &mut curr_data_block.bytes,
                 &mut vsz,
                 self.curr_offset_from_file,
@@ -249,21 +241,21 @@ impl CompactionFileElement {
                 self.curr_offset_from_file,
                 file_path,
             )?;
-            self.curr_offset_from_file += 8;
-            read_exact_or_corrupt(
+            self.curr_offset_from_file += U64_LEN as u64;
+            read_exact_or_truncated(
                 &mut curr_data_block.bytes,
                 &mut tmbstone,
                 self.curr_offset_from_file,
                 file_path,
             )?;
-            self.curr_offset_from_file += 1;
+            self.curr_offset_from_file += TOMBSTONE_LEN as u64;
 
             let deleted = match tmbstone[0] {
-                0xFF => true,
-                0x00 => false,
+                TOMBSTONE_DELETED => true,
+                TOMBSTONE_LIVE => false,
                 _ => {
                     return Err(DbError::DataCorrupted(DataCorruptedErr {
-                        offset: self.curr_offset_from_file - 1, //  point to the byte where tombstone begins
+                        offset: self.curr_offset_from_file - TOMBSTONE_LEN as u64, //  point to the byte where tombstone begins
                         file_path: self.sst_slice.file_path.clone(),
                         reason: crate::errors::CorruptionType::TombstoneCorrupted {
                             found: tmbstone[0],
@@ -273,7 +265,7 @@ impl CompactionFileElement {
             };
 
             let mut key: Vec<u8> = vec![0u8; key_size as usize];
-            read_exact_or_corrupt(
+            read_exact_or_truncated(
                 &mut curr_data_block.bytes,
                 &mut key,
                 self.curr_offset_from_file,
@@ -282,7 +274,7 @@ impl CompactionFileElement {
             self.curr_offset_from_file += key_size;
 
             let mut val: Vec<u8> = vec![0u8; val_size as usize];
-            read_exact_or_corrupt(
+            read_exact_or_truncated(
                 &mut curr_data_block.bytes,
                 &mut val,
                 self.curr_offset_from_file,
@@ -332,16 +324,14 @@ impl CompactionFileElement {
         }
 
         let mut bytes = vec![0u8; data_len as usize];
-        let mut crc = [0u8; 4];
-        read_exact_or_corrupt(reader, &mut bytes, self.curr_offset_from_file, &file_path)?;
+        let mut crc = [0u8; CRC_LEN];
+        read_exact_or_truncated(reader, &mut bytes, self.curr_offset_from_file, &file_path)?;
         self.curr_offset_from_file += data_len;
 
-        read_exact_or_corrupt(reader, &mut crc[..], self.curr_offset_from_file, &file_path)?;
+        read_exact_or_truncated(reader, &mut crc[..], self.curr_offset_from_file, &file_path)?;
 
         let crc_to_check = CRC32.compute_crc_data_block(&bytes);
         let crc_from_buff = u32::from_le_bytes(crc);
-        // Todo: the crc check/throw error needs to be put in a function, gets reused a lot
-        // have the caller account for this error
 
         check_crc(
             crc_to_check,
@@ -350,7 +340,7 @@ impl CompactionFileElement {
             &self.sst_slice.file_path,
             CrcType::DataBlock,
         )?;
-        self.reader_pos += data_len + 4;
+        self.reader_pos += data_len + CRC_LEN as u64;
         new_data_block.append_to_block(&bytes); // whole datablock
 
         self.current_data_block = Some(new_data_block);
@@ -366,6 +356,7 @@ impl CompactionFileElement {
 pub struct CompactionManager {
     // if theres a compaction currently running while we have another one just add to queue,
     // then remove from queue when compaction is done // pop
+    // only one for now
     running_job: Option<JoinHandle<Result<CompactionOutcome>>>,
 }
 
@@ -517,12 +508,12 @@ impl CompactionJob {
             &min_k,
             &max_k,
             sst_finalizer.sparse_index.index_entries.len() as u64,
-            (bloom_filter.bits.len() * 8) as u64,
+            (bloom_filter.bits.len() * U64_LEN) as u64,
             sst_finalizer.level,
         );
         // Repeating myself below with the boundary checks, put in a function
-        let footer_crc = CRC32.compute_crc_data_block(&footer[footer.len() - 41..]);
-        let min_max_crc = CRC32.compute_crc_data_block(&footer[..footer.len() - 41]);
+        let footer_crc = CRC32.compute_crc_data_block(&footer[footer.len() - FOOTER_FIXED_LEN..]);
+        let min_max_crc = CRC32.compute_crc_data_block(&footer[..footer.len() - FOOTER_FIXED_LEN]);
         let sparse_crc = CRC32.compute_crc_data_block(&sst_finalizer.sparse_index.index_entries);
 
         sst_finalizer
@@ -557,10 +548,9 @@ impl CompactionJob {
         // grab min key before we start
         let Some(first) = heap.peek() else {
             return Ok(());
-        }; // nothing to comoact
+        }; // nothing to compact
         let min_k = first.0.entry.key.clone();
 
-        // TODO: THE sst_finalizer below is assigned a new HLC, use the HIGHEST HLC from the input files instead.
         let mut sst_finalizer = SstFinalizer::new(
             &data_dir,
             min_k,
@@ -677,7 +667,6 @@ impl Eq for MergeItem {}
 /*
 TODOs:
 NOT DONE YET: Handle all errors
-NOD DONE YET(IMPORTANT): We need to ensure that the output files that are created after the merge, dont get prioritized over the other sstables by the timestamp id otherwise we might have older data take precedence over newer data
 NOT DONE YET: Perform compaction using multiple threads, split work into subCompactionJob where each thread works on specific slices of the input files
 NOT DONE YET: need pickFilesForCompaction function(before we do this, we should separate directories into L0, L1, L2, L3 etc)
 NOT DONE YET: needs pickSubSlicesOfFilesForCompaction // picks ranges(of each file) for each thread to work on.
